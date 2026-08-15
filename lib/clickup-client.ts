@@ -40,7 +40,11 @@ export type CUTimeEntry = {
 
 export async function getMe()                            { return (await get<{ user: CUMember }>("/user")).user; }
 export async function getTeams()                         { return (await get<{ teams: CUTeam[] }>("/team")).teams; }
-export async function getMembers(teamId: string)         { return (await get<{ members: { user: CUMember }[] }>(`/team/${teamId}/member`)).members.map(m => m.user); }
+export async function getMembers(teamId: string) {
+  // /team/{id}/member returns 404 on some plans — use /team/{id} instead
+  const data = await get<{ team: { members: { user: CUMember }[] } }>(`/team/${teamId}`);
+  return data.team.members.map(m => m.user);
+}
 export async function getSpaces(teamId: string)          { return (await get<{ spaces: CUSpace[] }>(`/team/${teamId}/space?archived=false`)).spaces; }
 export async function getTimeEntries(teamId: string, start: number, end: number) {
   return (await get<{ data: CUTimeEntry[] }>(`/team/${teamId}/time_entries?start_date=${start}&end_date=${end}`)).data ?? [];
