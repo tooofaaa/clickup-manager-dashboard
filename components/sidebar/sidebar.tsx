@@ -24,6 +24,7 @@ import {
   FolderPlus,
   LogOut,
   Star,
+  UserCheck,
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
@@ -92,6 +93,12 @@ export function Sidebar({ onCollapse }: { onCollapse?: () => void }) {
         />
         <InboxButton />
         <NavItem icon={<LayoutDashboard className="h-4 w-4" />} label="Manager Dashboard" active={pathname === "/dashboard"} onClick={() => router.push("/dashboard")} />
+        <NavItem
+          icon={<UserCheck className="h-4 w-4" />}
+          label="Team Evaluation"
+          active={pathname === "/team" || pathname.startsWith("/team/")}
+          onClick={() => router.push("/team")}
+        />
         <NavItem icon={<LayoutGrid className="h-4 w-4" />} label="Views" />
       </nav>
 
