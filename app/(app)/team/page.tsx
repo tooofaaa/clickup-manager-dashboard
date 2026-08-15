@@ -11,39 +11,20 @@ import {
   parseISO,
 } from "date-fns";
 import {
-  TrendingUp,
-  TrendingDown,
-  Minus,
   RefreshCw,
   AlertTriangle,
   SquareCheckBig,
   Clock,
   Users,
-  ChevronDown,
+  CheckCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
-// Types — mirror what /api/clickup/team-eval returns
+// Types — mirror the NEW /api/clickup/team-eval response shape
 // ---------------------------------------------------------------------------
-interface MemberMetrics {
-  score: number;
-  completionRate: number;
-  onTimeRate: number;
-  activityRate: number;
-  assigned: number;
-  completed: number;
-  overdue: number;
-  inProgress: number;
-  hoursLogged: number;
-  avgTaskAge: number;
-  spacesWorkedIn: string[];
-  priorityBreakdown: { urgent: number; high: number; normal: number; low: number };
-  trend: "up" | "down" | "stable";
-}
-
-interface EvalMember {
-  id: number;
+interface MemberInfo {
+  id: string;
   username: string | null;
   email: string;
   color: string | null;
@@ -51,9 +32,46 @@ interface EvalMember {
   initials: string;
 }
 
-interface EvalResult {
-  member: EvalMember;
+interface MemberMetrics {
+  score: number | null;
+  completionRate: number;
+  overdueRate: number;
+  completed: number;
+  inProgress: number;
+  notStarted: number;
+  overdue: number;
+  hoursLogged: number;
+}
+
+interface TeamMember {
+  member: MemberInfo;
+  taskCount: number;
   metrics: MemberMetrics;
+}
+
+interface SpaceHealth {
+  spaceId: string;
+  spaceName: string;
+  color: string | null;
+  total: number;
+  closed: number;
+  overdue: number;
+  pct: number;
+}
+
+interface TeamInsights {
+  totalTasks: number;
+  unassignedTasks: number;
+  overdueTotal: number;
+  tasksByStatus: { open: number; custom: number; closed: number };
+  tasksBySpace: SpaceHealth[];
+  membersWithTasks: number;
+  membersWithoutTasks: number;
+}
+
+interface TeamEvalResponse {
+  members: TeamMember[];
+  insights: TeamInsights;
   period: { start: number; end: number };
 }
 
@@ -76,20 +94,21 @@ function msFromInput(s: string): number {
   return fromInputValue(s).getTime();
 }
 
+interface DateRange {
+  start: string;
+  end: string;
+}
+
 // ---------------------------------------------------------------------------
 // DateRangePicker
 // ---------------------------------------------------------------------------
-interface DateRange {
-  start: string; // yyyy-MM-dd
-  end: string;   // yyyy-MM-dd
-}
-
-interface DateRangePickerProps {
+function DateRangePicker({
+  value,
+  onChange,
+}: {
   value: DateRange;
   onChange: (r: DateRange) => void;
-}
-
-function DateRangePicker({ value, onChange }: DateRangePickerProps) {
+}) {
   const today = new Date();
 
   const presets = [
@@ -103,11 +122,11 @@ function DateRangePicker({ value, onChange }: DateRangePickerProps) {
     {
       label: "Last Month",
       getRange: () => {
-        const lastMonth = subMonths(today, 1);
+        const last = subMonths(today, 1);
         return {
-          start: toInputValue(startOfMonth(lastMonth)),
+          start: toInputValue(startOfMonth(last)),
           end: toInputValue(
-            new Date(lastMonth.getFullYear(), lastMonth.getMonth() + 1, 0)
+            new Date(last.getFullYear(), last.getMonth() + 1, 0)
           ),
         };
       },
@@ -123,7 +142,6 @@ function DateRangePicker({ value, onChange }: DateRangePickerProps) {
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      {/* Quick presets */}
       {presets.map((p) => {
         const r = p.getRange();
         const active = r.start === value.start && r.end === value.end;
@@ -143,10 +161,8 @@ function DateRangePicker({ value, onChange }: DateRangePickerProps) {
         );
       })}
 
-      {/* Divider */}
       <span className="text-cu-text-tertiary">|</span>
 
-      {/* Manual inputs */}
       <div className="flex items-center gap-1.5">
         <span className="text-[12px] text-cu-text-tertiary">From</span>
         <input
@@ -171,51 +187,9 @@ function DateRangePicker({ value, onChange }: DateRangePickerProps) {
 }
 
 // ---------------------------------------------------------------------------
-// Score badge
-// ---------------------------------------------------------------------------
-function ScoreBadge({ score }: { score: number }) {
-  const color =
-    score >= 70
-      ? { bg: "#dcfce7", text: "#166534", ring: "#86efac" }
-      : score >= 40
-      ? { bg: "#fef9c3", text: "#854d0e", ring: "#fde047" }
-      : { bg: "#fee2e2", text: "#991b1b", ring: "#fca5a5" };
-
-  return (
-    <div
-      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[13px] font-bold"
-      style={{
-        backgroundColor: color.bg,
-        color: color.text,
-        boxShadow: `0 0 0 2px ${color.ring}`,
-      }}
-    >
-      {score}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Trend arrow
-// ---------------------------------------------------------------------------
-function TrendIcon({ trend }: { trend: "up" | "down" | "stable" }) {
-  if (trend === "up")
-    return <TrendingUp className="h-4 w-4 text-[#16a34a]" />;
-  if (trend === "down")
-    return <TrendingDown className="h-4 w-4 text-[#dc2626]" />;
-  return <Minus className="h-4 w-4 text-cu-text-tertiary" />;
-}
-
-// ---------------------------------------------------------------------------
 // Avatar
 // ---------------------------------------------------------------------------
-function Avatar({
-  member,
-  size = 40,
-}: {
-  member: EvalMember;
-  size?: number;
-}) {
+function Avatar({ member, size = 40 }: { member: MemberInfo; size?: number }) {
   const bg = member.color ?? "#7b68ee";
   const style = {
     width: size,
@@ -247,6 +221,46 @@ function Avatar({
 }
 
 // ---------------------------------------------------------------------------
+// Score badge — circle, coloured by value (null → gray)
+// ---------------------------------------------------------------------------
+function ScoreBadge({ score }: { score: number | null }) {
+  if (score === null) {
+    return (
+      <div
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[13px] font-bold"
+        style={{
+          backgroundColor: "var(--cu-hover)",
+          color: "var(--cu-text-tertiary)",
+          boxShadow: "0 0 0 2px var(--cu-border)",
+        }}
+      >
+        —
+      </div>
+    );
+  }
+
+  const color =
+    score >= 70
+      ? { bg: "#dcfce7", text: "#166534", ring: "#86efac" }
+      : score >= 40
+      ? { bg: "#fef9c3", text: "#854d0e", ring: "#fde047" }
+      : { bg: "#fee2e2", text: "#991b1b", ring: "#fca5a5" };
+
+  return (
+    <div
+      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[13px] font-bold"
+      style={{
+        backgroundColor: color.bg,
+        color: color.text,
+        boxShadow: `0 0 0 2px ${color.ring}`,
+      }}
+    >
+      {Math.round(score)}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Metric chip
 // ---------------------------------------------------------------------------
 function MetricChip({
@@ -259,31 +273,59 @@ function MetricChip({
   warn?: boolean;
 }) {
   return (
-    <div className="flex flex-col items-center gap-0.5">
-      <span
-        className={cn(
-          "text-[14px] font-bold",
-          warn ? "text-[#dc2626]" : "text-cu-text"
-        )}
-      >
+    <div
+      className={cn(
+        "flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium",
+        warn
+          ? "border-red-200 bg-red-50 text-red-700"
+          : "border-cu-border bg-cu-hover text-cu-text-secondary"
+      )}
+    >
+      <span className={cn("font-bold", warn ? "text-red-700" : "text-cu-text")}>
         {value}
       </span>
-      <span className="text-[10px] text-cu-text-tertiary">{label}</span>
+      {label}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// MemberCard
+// Completion bar
 // ---------------------------------------------------------------------------
-interface MemberCardProps {
-  result: EvalResult;
-  onClick: () => void;
+function CompletionBar({ pct }: { pct: number }) {
+  const clipped = Math.min(100, Math.max(0, pct));
+  const color =
+    clipped >= 70
+      ? "#16a34a"
+      : clipped >= 40
+      ? "#d97706"
+      : "#dc2626";
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="flex-1 overflow-hidden rounded-full bg-cu-hover" style={{ height: 5 }}>
+        <div
+          className="h-full rounded-full transition-all"
+          style={{ width: `${clipped}%`, backgroundColor: color }}
+        />
+      </div>
+      <span className="shrink-0 text-[11px] text-cu-text-tertiary">{Math.round(clipped)}%</span>
+    </div>
+  );
 }
 
-function MemberCard({ result, onClick }: MemberCardProps) {
-  const { member, metrics } = result;
-  const displayName = member.username || member.email.split("@")[0];
+// ---------------------------------------------------------------------------
+// MemberCard (for members with tasks)
+// ---------------------------------------------------------------------------
+function MemberCard({
+  entry,
+  onClick,
+}: {
+  entry: TeamMember;
+  onClick: () => void;
+}) {
+  const { member, taskCount, metrics } = entry;
+  const displayName = member.username ?? member.email.split("@")[0];
 
   return (
     <button
@@ -294,10 +336,16 @@ function MemberCard({ result, onClick }: MemberCardProps) {
       <div className="flex items-center gap-3">
         <Avatar member={member} size={40} />
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[13px] font-semibold text-cu-text" title={displayName}>
+          <p
+            className="truncate text-[13px] font-semibold text-cu-text"
+            title={displayName}
+          >
             {displayName}
           </p>
-          <p className="truncate text-[11px] text-cu-text-tertiary" title={member.email}>
+          <p
+            className="truncate text-[11px] text-cu-text-tertiary"
+            title={member.email}
+          >
             {member.email}
           </p>
         </div>
@@ -307,40 +355,20 @@ function MemberCard({ result, onClick }: MemberCardProps) {
       {/* Divider */}
       <div className="border-t border-cu-border" />
 
-      {/* 3 key metrics */}
-      <div className="flex items-center justify-around">
+      {/* Metric chips */}
+      <div className="flex flex-wrap gap-1.5">
+        <MetricChip label="assigned" value={String(taskCount)} />
+        <MetricChip label="done" value={String(metrics.completed)} />
+        <MetricChip label="in progress" value={String(metrics.inProgress)} />
         <MetricChip
-          label="Completion"
-          value={`${Math.round(metrics.completionRate)}%`}
-        />
-        <div className="h-8 w-px bg-cu-border" />
-        <MetricChip
-          label="Overdue"
+          label="overdue"
           value={String(metrics.overdue)}
           warn={metrics.overdue > 0}
         />
-        <div className="h-8 w-px bg-cu-border" />
-        <MetricChip
-          label="Hours"
-          value={
-            metrics.hoursLogged >= 10
-              ? `${Math.round(metrics.hoursLogged)}h`
-              : `${metrics.hoursLogged.toFixed(1)}h`
-          }
-        />
       </div>
 
-      {/* Trend */}
-      <div className="flex items-center justify-end gap-1 text-[11px] text-cu-text-tertiary">
-        <TrendIcon trend={metrics.trend} />
-        <span>
-          {metrics.trend === "up"
-            ? "Trending up"
-            : metrics.trend === "down"
-            ? "Trending down"
-            : "Stable"}
-        </span>
-      </div>
+      {/* Completion bar */}
+      <CompletionBar pct={metrics.completionRate} />
     </button>
   );
 }
@@ -348,18 +376,30 @@ function MemberCard({ result, onClick }: MemberCardProps) {
 // ---------------------------------------------------------------------------
 // KPI card
 // ---------------------------------------------------------------------------
-interface KpiCardProps {
+function KpiCard({
+  label,
+  value,
+  sub,
+  icon: Icon,
+  iconColor,
+  loading,
+  warn,
+}: {
   label: string;
   value: string | number;
   sub?: string;
   icon: React.ElementType;
   iconColor: string;
   loading?: boolean;
-}
-
-function KpiCard({ label, value, sub, icon: Icon, iconColor, loading }: KpiCardProps) {
+  warn?: boolean;
+}) {
   return (
-    <div className="flex items-center gap-3 rounded-xl border border-cu-border bg-cu-panel px-4 py-3 shadow-sm">
+    <div
+      className={cn(
+        "flex items-center gap-3 rounded-xl border bg-cu-panel px-4 py-3 shadow-sm",
+        warn ? "border-red-200" : "border-cu-border"
+      )}
+    >
       <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-cu-hover">
         <Icon className="h-4 w-4" style={{ color: iconColor }} />
       </span>
@@ -371,7 +411,14 @@ function KpiCard({ label, value, sub, icon: Icon, iconColor, loading }: KpiCardP
           </>
         ) : (
           <>
-            <p className="text-xl font-bold text-cu-text">{value}</p>
+            <p
+              className={cn(
+                "text-xl font-bold",
+                warn ? "text-red-600" : "text-cu-text"
+              )}
+            >
+              {value}
+            </p>
             <p className="truncate text-[11px] text-cu-text-tertiary">
               {sub ? `${label} · ${sub}` : label}
             </p>
@@ -383,17 +430,169 @@ function KpiCard({ label, value, sub, icon: Icon, iconColor, loading }: KpiCardP
 }
 
 // ---------------------------------------------------------------------------
-// Sort + filter types
+// Space Health table
 // ---------------------------------------------------------------------------
-type SortKey = "score" | "name" | "completionRate" | "overdue" | "hours";
+function SpaceHealthTable({ spaces }: { spaces: SpaceHealth[] }) {
+  const sorted = [...spaces].sort((a, b) => b.total - a.total);
 
-const SORT_OPTIONS: { value: SortKey; label: string }[] = [
-  { value: "score",          label: "Score" },
-  { value: "name",           label: "Name" },
-  { value: "completionRate", label: "Completion Rate" },
-  { value: "overdue",        label: "Overdue Count" },
-  { value: "hours",          label: "Hours" },
-];
+  return (
+    <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
+      <div className="border-b border-cu-border px-4 py-3">
+        <h2 className="text-[13px] font-semibold text-cu-text">Space Health</h2>
+        <p className="text-[11px] text-cu-text-tertiary">
+          Where work is happening this period
+        </p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-[12px]">
+          <thead>
+            <tr className="border-b border-cu-border bg-cu-hover">
+              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary">Space</th>
+              <th className="px-4 py-2.5 text-right font-medium text-cu-text-secondary">Total</th>
+              <th className="px-4 py-2.5 text-right font-medium text-cu-text-secondary">Closed</th>
+              <th className="px-4 py-2.5 text-right font-medium text-cu-text-secondary">Overdue</th>
+              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary min-w-[140px]">
+                Progress
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((s) => {
+              const pct = Math.min(100, Math.max(0, s.pct));
+              const barColor =
+                pct >= 70 ? "#16a34a" : pct >= 40 ? "#d97706" : "#dc2626";
+              return (
+                <tr
+                  key={s.spaceId}
+                  className="border-b border-cu-border last:border-b-0 hover:bg-cu-hover transition-colors"
+                >
+                  <td className="px-4 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ backgroundColor: s.color ?? "#7b68ee" }}
+                      />
+                      <span className="font-medium text-cu-text">{s.spaceName}</span>
+                    </div>
+                  </td>
+                  <td className="px-4 py-2.5 text-right font-medium text-cu-text">
+                    {s.total}
+                  </td>
+                  <td className="px-4 py-2.5 text-right text-cu-text-secondary">
+                    {s.closed}
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    <span
+                      className={cn(
+                        "font-medium",
+                        s.overdue > 0 ? "text-red-600" : "text-cu-text-secondary"
+                      )}
+                    >
+                      {s.overdue}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <div
+                        className="flex-1 overflow-hidden rounded-full bg-cu-hover"
+                        style={{ height: 6 }}
+                      >
+                        <div
+                          className="h-full rounded-full"
+                          style={{ width: `${pct}%`, backgroundColor: barColor }}
+                        />
+                      </div>
+                      <span className="shrink-0 w-8 text-right text-cu-text-tertiary">
+                        {Math.round(pct)}%
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+        {sorted.length === 0 && (
+          <div className="px-4 py-6 text-center text-[12px] text-cu-text-tertiary">
+            No space data for this period
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Compact member row (no tasks)
+// ---------------------------------------------------------------------------
+function MemberRow({ member }: { member: MemberInfo }) {
+  const displayName = member.username ?? member.email.split("@")[0];
+  return (
+    <div className="flex items-center gap-3 rounded-lg px-3 py-2 hover:bg-cu-hover transition-colors">
+      <Avatar member={member} size={28} />
+      <div className="min-w-0 flex-1">
+        <span className="text-[13px] font-medium text-cu-text truncate block">
+          {displayName}
+        </span>
+      </div>
+      <span className="shrink-0 text-[11px] text-cu-text-tertiary truncate max-w-[180px]">
+        {member.email}
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton
+// ---------------------------------------------------------------------------
+function PageSkeleton() {
+  return (
+    <div className="space-y-5">
+      {/* KPI row */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+        {Array.from({ length: 5 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex items-center gap-3 rounded-xl border border-cu-border bg-cu-panel px-4 py-3 shadow-sm"
+          >
+            <div className="h-9 w-9 shrink-0 animate-pulse rounded-lg bg-cu-hover" />
+            <div className="flex-1 space-y-1.5">
+              <div className="h-5 w-10 animate-pulse rounded bg-cu-hover" />
+              <div className="h-2.5 w-20 animate-pulse rounded bg-cu-hover" />
+            </div>
+          </div>
+        ))}
+      </div>
+      {/* Space table skeleton */}
+      <div className="h-40 animate-pulse rounded-xl border border-cu-border bg-cu-panel" />
+      {/* Member grid skeleton */}
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div
+            key={i}
+            className="animate-pulse rounded-xl border border-cu-border bg-cu-panel p-4 shadow-sm"
+          >
+            <div className="mb-3 flex items-center gap-3">
+              <div className="h-10 w-10 shrink-0 rounded-full bg-cu-hover" />
+              <div className="flex-1 space-y-1.5">
+                <div className="h-3 w-28 rounded bg-cu-hover" />
+                <div className="h-2.5 w-20 rounded bg-cu-hover" />
+              </div>
+              <div className="h-10 w-10 shrink-0 rounded-full bg-cu-hover" />
+            </div>
+            <div className="mb-3 h-px bg-cu-hover" />
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {[0, 1, 2, 3].map((j) => (
+                <div key={j} className="h-5 w-16 rounded-full bg-cu-hover" />
+              ))}
+            </div>
+            <div className="h-2 rounded-full bg-cu-hover" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Main page
@@ -407,101 +606,65 @@ export default function TeamEvalPage() {
     end: toInputValue(today),
   });
 
-  const [sortKey, setSortKey] = useState<SortKey>("score");
-  const [spaceFilter, setSpaceFilter] = useState<string>("all");
-
   const startMs = msFromInput(dateRange.start);
-  const endMs   = msFromInput(dateRange.end);
+  const endMs = msFromInput(dateRange.end);
 
-  const { data, isLoading, error, refetch, isFetching } = useQuery<EvalResult[]>({
-    queryKey: ["team-eval", dateRange.start, dateRange.end],
-    queryFn: async () => {
-      const url = `/api/clickup/team-eval?start=${startMs}&end=${endMs}`;
-      const r = await fetch(url);
-      if (!r.ok) {
-        let body = "";
-        try { body = await r.text(); } catch {/* */}
-        throw new Error(body || `HTTP ${r.status}`);
-      }
-      return r.json() as Promise<EvalResult[]>;
-    },
-    staleTime: 5 * 60 * 1000,
-    retry: 1,
-  });
+  const { data, isLoading, error, refetch, isFetching } =
+    useQuery<TeamEvalResponse>({
+      queryKey: ["team-eval", dateRange.start, dateRange.end],
+      queryFn: async () => {
+        const url = `/api/clickup/team-eval?start=${startMs}&end=${endMs}`;
+        const r = await fetch(url);
+        if (!r.ok) {
+          let body = "";
+          try {
+            body = await r.text();
+          } catch {
+            /* */
+          }
+          throw new Error(body || `HTTP ${r.status}`);
+        }
+        return r.json() as Promise<TeamEvalResponse>;
+      },
+      staleTime: 5 * 60 * 1000,
+      retry: 1,
+    });
 
-  // Collect unique space IDs from all results for the filter dropdown
-  const allSpaces = useMemo<string[]>(() => {
+  const hasError = !!error;
+  const errMessage = hasError ? String(error).replace(/^Error:\s*/, "") : null;
+
+  // Split members into with-tasks and without-tasks
+  const withTasks = useMemo<TeamMember[]>(() => {
     if (!data) return [];
-    const ids = new Set<string>();
-    for (const r of data) {
-      for (const s of r.metrics.spacesWorkedIn) ids.add(s);
-    }
-    return ["all", ...ids];
+    return [...data.members.filter((m) => m.taskCount > 0)].sort((a, b) => {
+      const sa = a.metrics.score;
+      const sb = b.metrics.score;
+      if (sa === null && sb === null) return 0;
+      if (sa === null) return 1;
+      if (sb === null) return -1;
+      return sb - sa;
+    });
   }, [data]);
 
-  // Apply filter
-  const filtered = useMemo<EvalResult[]>(() => {
+  const withoutTasks = useMemo<TeamMember[]>(() => {
     if (!data) return [];
-    if (spaceFilter === "all") return data;
-    return data.filter((r) => r.metrics.spacesWorkedIn.includes(spaceFilter));
-  }, [data, spaceFilter]);
-
-  // Apply sort
-  const sorted = useMemo<EvalResult[]>(() => {
-    const copy = [...filtered];
-    switch (sortKey) {
-      case "score":
-        return copy.sort((a, b) => b.metrics.score - a.metrics.score);
-      case "name": {
-        const name = (r: EvalResult) =>
-          r.member.username || r.member.email.split("@")[0];
-        return copy.sort((a, b) => name(a).localeCompare(name(b)));
-      }
-      case "completionRate":
-        return copy.sort(
-          (a, b) => b.metrics.completionRate - a.metrics.completionRate
-        );
-      case "overdue":
-        return copy.sort((a, b) => b.metrics.overdue - a.metrics.overdue);
-      case "hours":
-        return copy.sort(
-          (a, b) => b.metrics.hoursLogged - a.metrics.hoursLogged
-        );
-    }
-  }, [filtered, sortKey]);
-
-  // Aggregate KPIs
-  const kpis = useMemo(() => {
-    if (!data || data.length === 0)
-      return { totalTasks: 0, avgCompletion: 0, totalOverdue: 0, totalHours: 0 };
-    const totalTasks = data.reduce((s, r) => s + r.metrics.assigned, 0);
-    const avgCompletion =
-      data.reduce((s, r) => s + r.metrics.completionRate, 0) / data.length;
-    const totalOverdue = data.reduce((s, r) => s + r.metrics.overdue, 0);
-    const totalHours = data.reduce((s, r) => s + r.metrics.hoursLogged, 0);
-    return { totalTasks, avgCompletion, totalOverdue, totalHours };
+    return data.members.filter((m) => m.taskCount === 0);
   }, [data]);
 
-  // Human-readable period label
+  const insights = data?.insights;
+
   const periodLabel = `${format(fromInputValue(dateRange.start), "MMM d")} – ${format(
     fromInputValue(dateRange.end),
     "MMM d, yyyy"
   )}`;
 
-  const hasError = !!error;
-  const errMessage = hasError
-    ? String(error).replace(/^Error:\s*/, "")
-    : null;
-
-  function navigateToMember(memberId: number) {
-    router.push(
-      `/team/${memberId}?start=${dateRange.start}&end=${dateRange.end}`
-    );
+  function navigateToMember(memberId: string) {
+    router.push(`/team/${memberId}?start=${dateRange.start}&end=${dateRange.end}`);
   }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      {/* ── Header ──────────────────────────────────────────────────────── */}
       <div className="flex shrink-0 items-center justify-between border-b border-cu-border bg-cu-panel px-6 py-3.5">
         <div>
           <h1 className="text-[16px] font-bold text-cu-text">Team Evaluation</h1>
@@ -514,12 +677,14 @@ export default function TeamEvalPage() {
           disabled={isFetching}
           className="flex items-center gap-1.5 rounded-lg border border-cu-border px-3 py-1.5 text-[13px] text-cu-text-secondary hover:bg-cu-hover disabled:opacity-50"
         >
-          <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+          <RefreshCw
+            className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
+          />
           Refresh
         </button>
       </div>
 
-      {/* ── Error banner ─────────────────────────────────────────────────── */}
+      {/* ── Error banner ────────────────────────────────────────────────── */}
       {hasError && (
         <div className="shrink-0 border-b border-[#fca5a5] bg-[#fef2f2] px-6 py-2.5">
           <div className="flex items-center justify-between gap-3">
@@ -544,166 +709,123 @@ export default function TeamEvalPage() {
         </div>
       )}
 
-      {/* ── Scrollable body ──────────────────────────────────────────────── */}
+      {/* ── Scrollable body ─────────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+        {/* Date range picker */}
+        <DateRangePicker value={dateRange} onChange={setDateRange} />
 
-        {/* ── Controls row ─────────────────────────────────────────────── */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <DateRangePicker value={dateRange} onChange={setDateRange} />
-
-          <div className="flex items-center gap-2">
-            {/* Sort selector */}
-            <div className="relative">
-              <select
-                value={sortKey}
-                onChange={(e) => setSortKey(e.target.value as SortKey)}
-                className="appearance-none rounded-lg border border-cu-border bg-cu-panel py-1.5 pl-3 pr-8 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-              >
-                {SORT_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    Sort: {o.label}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-cu-text-tertiary" />
-            </div>
-
-            {/* Space filter */}
-            {allSpaces.length > 1 && (
-              <div className="relative">
-                <select
-                  value={spaceFilter}
-                  onChange={(e) => setSpaceFilter(e.target.value)}
-                  className="appearance-none rounded-lg border border-cu-border bg-cu-panel py-1.5 pl-3 pr-8 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-                >
-                  {allSpaces.map((s) => (
-                    <option key={s} value={s}>
-                      {s === "all" ? "All Spaces" : `Space ${s}`}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-cu-text-tertiary" />
+        {isLoading ? (
+          <PageSkeleton />
+        ) : (
+          <>
+            {/* ── 5-card KPI row ───────────────────────────────────────── */}
+            {insights && (
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+                <KpiCard
+                  label="Total Tasks"
+                  value={insights.totalTasks}
+                  icon={SquareCheckBig}
+                  iconColor="#7b68ee"
+                />
+                <KpiCard
+                  label="Unassigned"
+                  value={insights.unassignedTasks}
+                  icon={Users}
+                  iconColor={
+                    insights.unassignedTasks > insights.totalTasks / 2
+                      ? "#dc2626"
+                      : "#0ea5e9"
+                  }
+                  warn={insights.unassignedTasks > insights.totalTasks / 2}
+                />
+                <KpiCard
+                  label="Overdue"
+                  value={insights.overdueTotal}
+                  icon={AlertTriangle}
+                  iconColor={insights.overdueTotal > 0 ? "#dc2626" : "#10b981"}
+                  warn={insights.overdueTotal > 0}
+                />
+                <KpiCard
+                  label="Active Members"
+                  value={`${insights.membersWithTasks} / 28`}
+                  sub="of team"
+                  icon={Users}
+                  iconColor="#f59e0b"
+                />
+                <KpiCard
+                  label="Completed"
+                  value={insights.tasksByStatus.closed}
+                  icon={CheckCheck}
+                  iconColor="#16a34a"
+                />
               </div>
             )}
-          </div>
-        </div>
 
-        {/* ── KPI summary cards ────────────────────────────────────────── */}
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <KpiCard
-            label="Total Tasks"
-            value={isLoading ? "—" : kpis.totalTasks}
-            icon={SquareCheckBig}
-            iconColor="#7b68ee"
-            loading={isLoading}
-          />
-          <KpiCard
-            label="Avg Completion"
-            value={
-              isLoading ? "—" : `${Math.round(kpis.avgCompletion)}%`
-            }
-            sub={`${sorted.length} member${sorted.length !== 1 ? "s" : ""}`}
-            icon={Users}
-            iconColor="#0ea5e9"
-            loading={isLoading}
-          />
-          <KpiCard
-            label="Team Overdue"
-            value={isLoading ? "—" : kpis.totalOverdue}
-            icon={AlertTriangle}
-            iconColor="#ef4444"
-            loading={isLoading}
-          />
-          <KpiCard
-            label="Total Hours"
-            value={
-              isLoading
-                ? "—"
-                : kpis.totalHours >= 10
-                ? `${Math.round(kpis.totalHours)}h`
-                : `${kpis.totalHours.toFixed(1)}h`
-            }
-            icon={Clock}
-            iconColor="#10b981"
-            loading={isLoading}
-          />
-        </div>
+            {/* ── Space Health table ───────────────────────────────────── */}
+            {insights && insights.tasksBySpace.length > 0 && (
+              <SpaceHealthTable spaces={insights.tasksBySpace} />
+            )}
 
-        {/* ── Team grid ────────────────────────────────────────────────── */}
-        {isLoading ? (
-          <GridSkeleton />
-        ) : sorted.length === 0 ? (
-          <EmptyState hasFilter={spaceFilter !== "all"} />
-        ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {sorted.map((result) => (
-              <MemberCard
-                key={result.member.id}
-                result={result}
-                onClick={() => navigateToMember(result.member.id)}
-              />
-            ))}
-          </div>
+            {/* ── Members with tasks ──────────────────────────────────── */}
+            {withTasks.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-[13px] font-semibold text-cu-text">
+                    Members with assigned tasks
+                  </h2>
+                  <span className="rounded-full bg-cu-hover px-2 py-0.5 text-[11px] font-medium text-cu-text-secondary">
+                    {withTasks.length}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {withTasks.map((entry) => (
+                    <MemberCard
+                      key={entry.member.id}
+                      entry={entry}
+                      onClick={() => navigateToMember(entry.member.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── Members without tasks ───────────────────────────────── */}
+            {withoutTasks.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-[13px] font-semibold text-cu-text">
+                    Team members
+                  </h2>
+                  <span className="rounded-full bg-cu-hover px-2 py-0.5 text-[11px] font-medium text-cu-text-secondary">
+                    {withoutTasks.length}
+                  </span>
+                  <span className="text-[11px] text-cu-text-tertiary">
+                    — no tasks assigned this period
+                  </span>
+                </div>
+                <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm divide-y divide-cu-border overflow-hidden">
+                  {withoutTasks.map((entry) => (
+                    <MemberRow key={entry.member.id} member={entry.member} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── Empty state ─────────────────────────────────────────── */}
+            {!insights && !isLoading && (
+              <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-cu-border py-16 text-center">
+                <Users className="h-8 w-8 text-cu-text-tertiary" />
+                <p className="text-[14px] font-medium text-cu-text">
+                  No team data available
+                </p>
+                <p className="text-[13px] text-cu-text-tertiary">
+                  No data was returned for this period.
+                </p>
+              </div>
+            )}
+          </>
         )}
       </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Skeleton
-// ---------------------------------------------------------------------------
-function GridSkeleton() {
-  return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-      {Array.from({ length: 6 }).map((_, i) => (
-        <div
-          key={i}
-          className="animate-pulse rounded-xl border border-cu-border bg-cu-panel p-4 shadow-sm"
-        >
-          {/* Avatar + name */}
-          <div className="mb-3 flex items-center gap-3">
-            <div className="h-10 w-10 shrink-0 rounded-full bg-cu-hover" />
-            <div className="flex-1 space-y-1.5">
-              <div className="h-3 w-28 rounded bg-cu-hover" />
-              <div className="h-2.5 w-20 rounded bg-cu-hover" />
-            </div>
-            <div className="h-10 w-10 shrink-0 rounded-full bg-cu-hover" />
-          </div>
-          {/* Divider */}
-          <div className="mb-3 h-px bg-cu-hover" />
-          {/* Metrics row */}
-          <div className="mb-3 flex justify-around">
-            {[0, 1, 2].map((j) => (
-              <div key={j} className="flex flex-col items-center gap-1">
-                <div className="h-4 w-8 rounded bg-cu-hover" />
-                <div className="h-2.5 w-14 rounded bg-cu-hover" />
-              </div>
-            ))}
-          </div>
-          {/* Trend */}
-          <div className="flex justify-end">
-            <div className="h-3 w-20 rounded bg-cu-hover" />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Empty state
-// ---------------------------------------------------------------------------
-function EmptyState({ hasFilter }: { hasFilter: boolean }) {
-  return (
-    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-cu-border py-16 text-center">
-      <Users className="h-8 w-8 text-cu-text-tertiary" />
-      <p className="text-[14px] font-medium text-cu-text">No team members found</p>
-      <p className="text-[13px] text-cu-text-tertiary">
-        {hasFilter
-          ? "No members worked in the selected space during this period."
-          : "No team member data is available for this period."}
-      </p>
     </div>
   );
 }

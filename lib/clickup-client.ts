@@ -354,7 +354,7 @@ export async function getTasks(
 
     // Stop when the API signals the last page or returns a partial page.
     // A partial page (< 100 items) reliably indicates end-of-data in ClickUp v2.
-    if (data.last_page === true || tasks.length < 100) break;
+    if (data.last_page === true || tasks.length === 0) break;
   }
 
   return allTasks;
