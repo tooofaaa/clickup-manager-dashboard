@@ -33,6 +33,9 @@ export const GET = route(async (_req, { params }: Ctx) => {
 });
 
 export const PATCH = route(async (req, { params }: Ctx) => {
+  if (process.env.CLICKUP_API_TOKEN) {
+    return NextResponse.json({ error: 'Read-only mode: edit tasks directly in ClickUp' }, { status: 403 });
+  }
   const { taskId } = await params;
   const patch = await readJson(req, patchSchema);
   const { user } = await requireRole("MEMBER");
@@ -41,6 +44,9 @@ export const PATCH = route(async (req, { params }: Ctx) => {
 });
 
 export const DELETE = route(async (_req, { params }: Ctx) => {
+  if (process.env.CLICKUP_API_TOKEN) {
+    return NextResponse.json({ error: 'Read-only mode: edit tasks directly in ClickUp' }, { status: 403 });
+  }
   const { taskId } = await params;
   await requireRole("MEMBER");
   const task = await prisma.task.findUnique({ where: { id: taskId }, select: { listId: true } });

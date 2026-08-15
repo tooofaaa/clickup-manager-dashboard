@@ -14,6 +14,9 @@ const schema = z.object({
 });
 
 export const POST = route(async (req) => {
+  if (process.env.CLICKUP_API_TOKEN) {
+    return NextResponse.json({ error: 'Read-only mode: edit tasks directly in ClickUp' }, { status: 403 });
+  }
   const body = await readJson(req, schema);
   const { user } = await requireRole("MEMBER");
   const task = await createTask({

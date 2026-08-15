@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { getListData } from "@/lib/queries";
@@ -5,6 +7,7 @@ import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { requireRole } from "@/lib/permissions";
 import { readJson, route, ApiError } from "@/lib/api-helpers";
+import { getCUListData } from "@/lib/clickup-list";
 
 type Ctx = { params: Promise<{ listId: string }> };
 const schema = z.object({
@@ -15,6 +18,13 @@ const schema = z.object({
 export const GET = route(async (_req, { params }: Ctx) => {
   const { listId } = await params;
   await requireUser();
+
+  if (process.env.CLICKUP_API_TOKEN) {
+    const data = await getCUListData(listId);
+    if (!data) throw new ApiError(404, "List not found");
+    return NextResponse.json(data);
+  }
+
   const data = await getListData(listId);
   if (!data) throw new ApiError(404, "List not found");
   return NextResponse.json(data);
