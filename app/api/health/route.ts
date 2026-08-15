@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 
+export const dynamic = "force-dynamic";
+
 // Unauthenticated liveness/readiness probe for load balancers, uptime
 // monitors, and container healthchecks. Returns 200 when the DB is reachable,
 // 503 otherwise.
