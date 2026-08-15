@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "prisma generate && ([ -n \"$DATABASE_URL\" ] && prisma migrate deploy || echo 'No DATABASE_URL, skipping migrate') && next build",
     "start": "next start",
     "lint": "eslint",
     "db:seed": "tsx prisma/seed.ts",
@@ -43,6 +43,8 @@
     "pg": "^8.21.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
+    "react-grid-layout": "^2.2.4",
+    "recharts": "^3.10.1",
     "tailwind-merge": "^3.6.0",
     "zod": "^4.4.3"
   },

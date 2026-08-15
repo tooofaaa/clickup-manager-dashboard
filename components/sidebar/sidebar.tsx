@@ -10,6 +10,7 @@ import {
   Plus,
   Search,
   House,
+  LayoutDashboard,
   LayoutGrid,
   Ellipsis,
   Folder as FolderIcon,
@@ -90,7 +91,8 @@ export function Sidebar({ onCollapse }: { onCollapse?: () => void }) {
           onClick={() => router.push("/home")}
         />
         <InboxButton />
-        <NavItem icon={<LayoutGrid className="h-4 w-4" />} label="Dashboards" />
+        <NavItem icon={<LayoutDashboard className="h-4 w-4" />} label="Manager Dashboard" active={pathname === "/dashboard"} onClick={() => router.push("/dashboard")} />
+        <NavItem icon={<LayoutGrid className="h-4 w-4" />} label="Views" />
       </nav>
 
       {favLists.length > 0 && (
