@@ -1,58 +1,157 @@
 import { NextResponse } from "next/server";
-import { getMe, getMembers, getSpaces, getTasks, getTimeEntries, type CUTask } from "@/lib/clickup-client";
+import {
+  getMe,
+  getMembers,
+  getSpaces,
+  getTasks,
+  getTimeEntries,
+  type CUUser,
+  type CUMemberUser,
+  type CUTask,
+} from "@/lib/clickup-client";
+
+export const dynamic = "force-dynamic";
+
+/** Safely settle a promise and return its value or a fallback. */
+async function settle<T>(p: Promise<T>, fallback: T): Promise<T> {
+  try {
+    return await p;
+  } catch (err) {
+    console.error("[dashboard] partial fetch failed:", err);
+    return fallback;
+  }
+}
 
 export async function GET(req: Request) {
   const teamId = process.env.CLICKUP_TEAM_ID;
-  if (!teamId) return NextResponse.json({ error: "CLICKUP_TEAM_ID not set" }, { status: 400 });
+  if (!teamId)
+    return NextResponse.json({ error: "CLICKUP_TEAM_ID not set" }, { status: 400 });
+
   const spaceId = new URL(req.url).searchParams.get("spaceId") ?? undefined;
 
-  try {
-    const now = Date.now();
-    const weekStart = now - 7 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  // Use Monday of the current ISO week as the week boundary.
+  const d = new Date(now);
+  const dayOfWeek = d.getUTCDay(); // 0=Sun
+  const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+  const weekStart = new Date(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + mondayOffset)
+  ).getTime();
 
-    const [me, members, spaces, tasks, timeEntries] = await Promise.all([
-      getMe(),
-      getMembers(teamId),
-      getSpaces(teamId),
-      getTasks(teamId, { include_closed: false, ...(spaceId ? { space_ids: spaceId } : {}) }),
-      getTimeEntries(teamId, weekStart, now),
-    ]);
+  // Build task query params.  ClickUp expects space_ids[] as repeated params but
+  // getTasks uses URLSearchParams.set which produces a single key; that is the
+  // correct wire format for the v2 endpoint when filtering by one space.
+  const taskParams: Record<string, string | number | boolean> = {
+    include_closed: false,
+    ...(spaceId ? { "space_ids[]": spaceId } : {}),
+  };
 
-    const overdue = tasks.filter(t =>
-      t.due_date && Number(t.due_date) < now && t.status.type !== "closed" && t.status.type !== "done"
-    );
+  // Fetch all five data-sources in parallel; a failure in any one returns its
+  // typed fallback so the rest of the dashboard still renders.
+  const [me, members, spaces, tasks, timeEntries] = await Promise.all([
+    settle(getMe(), null as unknown as CUUser),
+    settle(getMembers(teamId), [] as CUMemberUser[]),
+    settle(getSpaces(teamId), []),
+    settle(getTasks(teamId, taskParams), [] as CUTask[]),
+    settle(getTimeEntries(teamId, weekStart, now), []),
+  ]);
 
-    const workload: Record<string, { member: (typeof members)[0]; tasks: CUTask[]; overdueCount: number }> = {};
-    for (const m of members) workload[m.id] = { member: m, tasks: [], overdueCount: 0 };
-    for (const t of tasks) {
-      for (const a of t.assignees) {
-        if (workload[a.id]) {
-          workload[a.id].tasks.push(t);
-          if (t.due_date && Number(t.due_date) < now) workload[a.id].overdueCount++;
+  // ── overdue ──────────────────────────────────────────────────────────────
+  const overdue = tasks.filter(
+    (t) =>
+      t.due_date &&
+      Number(t.due_date) < now &&
+      t.status.type !== "done" &&
+      t.status.type !== "closed"
+  );
+
+  // ── workload ─────────────────────────────────────────────────────────────
+  // CUMemberUser.id is a number; use String(id) as the map key throughout.
+  const workload: Record<
+    string,
+    { member: CUMemberUser; tasks: CUTask[]; overdueCount: number }
+  > = {};
+
+  for (const m of members) {
+    workload[String(m.id)] = { member: m, tasks: [], overdueCount: 0 };
+  }
+
+  for (const t of tasks) {
+    for (const a of t.assignees) {
+      const key = String(a.id);
+      if (workload[key]) {
+        workload[key].tasks.push(t);
+        // Only count as overdue when the task is actually open/active.
+        if (
+          t.due_date &&
+          Number(t.due_date) < now &&
+          t.status.type !== "done" &&
+          t.status.type !== "closed"
+        ) {
+          workload[key].overdueCount++;
         }
       }
     }
-
-    const timeByMember: Record<string, number> = {};
-    for (const e of timeEntries) {
-      const uid = String(e.user.id);
-      timeByMember[uid] = (timeByMember[uid] ?? 0) + e.duration;
-    }
-
-    const spaceHealth = spaces.map(s => {
-      const st = tasks.filter(t => t.space.id === s.id);
-      const done = st.filter(t => t.status.type === "done" || t.status.type === "closed").length;
-      const overdueCount = st.filter(t => t.due_date && Number(t.due_date) < now && t.status.type !== "done" && t.status.type !== "closed").length;
-      return { id: s.id, name: s.name, color: s.color ?? "#7b68ee", total: st.length, done, overdue: overdueCount, pct: st.length > 0 ? Math.round((done / st.length) * 100) : 0 };
-    });
-
-    return NextResponse.json({
-      me, members, spaces: spaceHealth, workload: Object.values(workload), overdue,
-      recentTasks: [...tasks].sort((a, b) => Number(b.date_updated) - Number(a.date_updated)).slice(0, 30),
-      timeByMember,
-      totals: { tasks: tasks.length, overdue: overdue.length, members: members.length, hoursThisWeek: Math.round(Object.values(timeByMember).reduce((a, b) => a + b, 0) / 3_600_000) },
-    });
-  } catch (err) {
-    return NextResponse.json({ error: String(err) }, { status: 500 });
   }
+
+  // ── timeByMember ─────────────────────────────────────────────────────────
+  // duration is in milliseconds; keep as-is here, convert to hours in totals.
+  const timeByMember: Record<string, number> = {};
+  for (const e of timeEntries) {
+    const uid = String(e.user.id);
+    timeByMember[uid] = (timeByMember[uid] ?? 0) + e.duration;
+  }
+
+  // ── spaceHealth ──────────────────────────────────────────────────────────
+  const spaceHealth = spaces.map((s) => {
+    const spaceTasks = tasks.filter((t) => t.space.id === s.id);
+    const total = spaceTasks.length;
+    const done = spaceTasks.filter(
+      (t) => t.status.type === "done" || t.status.type === "closed"
+    ).length;
+    const overdueCount = spaceTasks.filter(
+      (t) =>
+        t.due_date &&
+        Number(t.due_date) < now &&
+        t.status.type !== "done" &&
+        t.status.type !== "closed"
+    ).length;
+    // Guard against division by zero when a space has no tasks.
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    return {
+      id: s.id,
+      name: s.name,
+      color: s.color ?? "#7b68ee",
+      total,
+      done,
+      overdue: overdueCount,
+      pct,
+    };
+  });
+
+  // ── recentTasks ──────────────────────────────────────────────────────────
+  const recentTasks = [...tasks]
+    .sort((a, b) => Number(b.date_updated) - Number(a.date_updated))
+    .slice(0, 30);
+
+  // ── totals ───────────────────────────────────────────────────────────────
+  const totalMs = Object.values(timeByMember).reduce((sum, ms) => sum + ms, 0);
+  // Convert milliseconds → hours (round to one decimal place).
+  const hoursThisWeek = Math.round((totalMs / 3_600_000) * 10) / 10;
+
+  return NextResponse.json({
+    me,
+    members,
+    spaces: spaceHealth,
+    workload: Object.values(workload),
+    overdue,
+    recentTasks,
+    timeByMember,
+    totals: {
+      tasks: tasks.length,
+      overdue: overdue.length,
+      members: members.length,
+      hoursThisWeek,
+    },
+  });
 }
