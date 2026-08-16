@@ -17,6 +17,7 @@ import {
   Clock,
   Users,
   CheckCheck,
+  BarChart2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -63,10 +64,16 @@ interface TeamInsights {
   totalTasks: number;
   unassignedTasks: number;
   overdueTotal: number;
+  completedInPeriod: number;
+  createdInPeriod: number;
+  avgCompletionTimeHours: number;
+  busiestSpace: { spaceName: string; color: string; total: number } | null;
   tasksByStatus: { open: number; custom: number; closed: number };
   tasksBySpace: SpaceHealth[];
   membersWithTasks: number;
   membersWithoutTasks: number;
+  hasPeriodData: boolean;
+  totalTasksAllTime: number;
 }
 
 interface TeamEvalResponse {
@@ -720,9 +727,18 @@ export default function TeamEvalPage() {
           <PageSkeleton />
         ) : (
           <>
-            {/* ── 5-card KPI row ───────────────────────────────────────── */}
+            {/* ── Period warning banner ────────────────────────────────── */}
+            {insights && !insights.hasPeriodData && (
+              <div className="flex items-center gap-2 rounded-lg border border-cu-border bg-cu-hover px-4 py-2.5 text-[13px] text-cu-text-secondary">
+                <AlertTriangle className="h-4 w-4 shrink-0 text-[#f59e0b]" />
+                No task activity found in this date range — showing all-time data ({insights.totalTasksAllTime} tasks).
+                Most recent task updates: March 2026.
+              </div>
+            )}
+
+            {/* ── 8-card KPI row ───────────────────────────────────────── */}
             {insights && (
-              <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8">
                 <KpiCard
                   label="Total Tasks"
                   value={insights.totalTasks}
@@ -733,11 +749,7 @@ export default function TeamEvalPage() {
                   label="Unassigned"
                   value={insights.unassignedTasks}
                   icon={Users}
-                  iconColor={
-                    insights.unassignedTasks > insights.totalTasks / 2
-                      ? "#dc2626"
-                      : "#0ea5e9"
-                  }
+                  iconColor={insights.unassignedTasks > insights.totalTasks / 2 ? "#dc2626" : "#0ea5e9"}
                   warn={insights.unassignedTasks > insights.totalTasks / 2}
                 />
                 <KpiCard
@@ -756,9 +768,28 @@ export default function TeamEvalPage() {
                 />
                 <KpiCard
                   label="Completed"
-                  value={insights.tasksByStatus.closed}
+                  value={insights.completedInPeriod}
                   icon={CheckCheck}
                   iconColor="#16a34a"
+                />
+                <KpiCard
+                  label="Created in Period"
+                  value={insights.createdInPeriod}
+                  icon={SquareCheckBig}
+                  iconColor="#8b5cf6"
+                />
+                <KpiCard
+                  label="Avg Completion"
+                  value={insights.avgCompletionTimeHours > 0 ? `${insights.avgCompletionTimeHours}h` : "—"}
+                  icon={Clock}
+                  iconColor="#0ea5e9"
+                />
+                <KpiCard
+                  label="Busiest Space"
+                  value={insights.busiestSpace?.spaceName ?? "—"}
+                  sub={insights.busiestSpace ? `${insights.busiestSpace.total} tasks` : ""}
+                  icon={BarChart2}
+                  iconColor={insights.busiestSpace?.color ?? "#7b68ee"}
                 />
               </div>
             )}
