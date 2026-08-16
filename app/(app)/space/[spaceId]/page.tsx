@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { format } from "date-fns";
@@ -15,6 +15,7 @@ import {
   ExternalLink,
   Calendar,
   Clock,
+  RefreshCw,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CUTask } from "@/lib/clickup-client";
@@ -942,7 +943,7 @@ export default function SpaceDetailPage() {
 
   const [viewMode, setViewMode] = useState<ViewMode>("project");
 
-  const { data, isLoading, error } = useQuery<SpaceDetailResponse>({
+  const { data, isLoading, isFetching, refetch, dataUpdatedAt, error } = useQuery<SpaceDetailResponse>({
     queryKey: ["space", spaceId],
     queryFn: async () => {
       const r = await fetch(`/api/clickup/space/${spaceId}`);
@@ -958,6 +959,8 @@ export default function SpaceDetailPage() {
       return r.json() as Promise<SpaceDetailResponse>;
     },
     staleTime: 5 * 60 * 1000,
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
     retry: 1,
   });
 
@@ -967,6 +970,66 @@ export default function SpaceDetailPage() {
   const space = data?.space;
   const stats = data?.stats;
   const hasNoTasks = !isLoading && data && stats?.totalTasks === 0;
+
+  // ── Live sync indicator ──────────────────────────────────────────────────
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+  const secondsAgo = dataUpdatedAt ? Math.round((now - dataUpdatedAt) / 1000) : null;
+  const timeLabel =
+    secondsAgo === null
+      ? "—"
+      : secondsAgo < 60
+        ? `${secondsAgo}s ago`
+        : `${Math.round(secondsAgo / 60)}m ago`;
+
+  // ── Filter state ─────────────────────────────────────────────────────────
+  type StatusFilter = "all" | "open" | "in-progress" | "closed" | "overdue";
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const filterTask = useCallback(
+    (task: CUTask): boolean => {
+      if (searchTerm && !task.name.toLowerCase().includes(searchTerm.toLowerCase()))
+        return false;
+      if (statusFilter === "open") return task.status.type === "open";
+      if (statusFilter === "in-progress") return task.status.type === "custom";
+      if (statusFilter === "closed")
+        return task.status.type === "closed" || task.status.type === "done";
+      if (statusFilter === "overdue") return isOverdue(task);
+      return true;
+    },
+    [statusFilter, searchTerm]
+  );
+
+  const filteredByList = useMemo(
+    () => data?.byList.map((e) => ({ ...e, tasks: e.tasks.filter(filterTask) })) ?? [],
+    [data, filterTask]
+  );
+  const filteredByAssignee = useMemo(
+    () => data?.byAssignee.map((e) => ({ ...e, tasks: e.tasks.filter(filterTask) })) ?? [],
+    [data, filterTask]
+  );
+  const filteredUnassignedTasks = useMemo(
+    () => (data?.unassignedTasks ?? []).filter(filterTask),
+    [data, filterTask]
+  );
+  const filteredTasks = useMemo(
+    () => (data?.tasks ?? []).filter(filterTask),
+    [data, filterTask]
+  );
+
+  // ── Tab counts ───────────────────────────────────────────────────────────
+  const tabCounts = useMemo(
+    () => ({
+      project: data?.byList.length ?? 0,
+      person: data?.byAssignee.length ?? 0,
+      timeline: data?.tasks.filter((t) => t.due_date || t.start_date).length ?? 0,
+    }),
+    [data]
+  );
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -990,6 +1053,15 @@ export default function SpaceDetailPage() {
                 style={{ backgroundColor: space.color ?? "var(--cu-purple)" }}
               />
               <h1 className="text-[18px] font-bold text-cu-text">{space.name}</h1>
+              <a
+                href={`https://app.clickup.com/space/${spaceId}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-cu-text-tertiary transition-colors hover:text-cu-purple"
+                title="Open in ClickUp"
+              >
+                <ExternalLink className="h-4 w-4" />
+              </a>
             </div>
           ) : (
             <div className="flex items-center gap-2.5">
@@ -1022,6 +1094,27 @@ export default function SpaceDetailPage() {
             ))}
           </div>
         )}
+
+        {/* Live sync indicator */}
+        {dataUpdatedAt > 0 && (
+          <div className="mt-2 flex items-center gap-2 text-[11px] text-cu-text-tertiary">
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full",
+                isFetching ? "animate-pulse bg-green-500" : "bg-gray-400"
+              )}
+            />
+            <span>Updated {timeLabel}</span>
+            <button
+              onClick={() => refetch()}
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-cu-text-secondary transition-colors hover:bg-cu-hover hover:text-cu-text"
+              title="Refresh"
+            >
+              <RefreshCw className={cn("h-3 w-3", isFetching && "animate-spin")} />
+              Refresh
+            </button>
+          </div>
+        )}
       </div>
 
       {/* ── Error banner ────────────────────────────────────────────────────── */}
@@ -1039,9 +1132,9 @@ export default function SpaceDetailPage() {
         <div className="flex gap-0">
           {(
             [
-              { id: "project" as const, label: "By Project" },
-              { id: "person" as const, label: "By Person" },
-              { id: "timeline" as const, label: "Timeline" },
+              { id: "project" as const, label: "By Project", count: tabCounts.project },
+              { id: "person" as const, label: "By Person", count: tabCounts.person },
+              { id: "timeline" as const, label: "Timeline", count: tabCounts.timeline },
             ] as const
           ).map((tab) => (
             <button
@@ -1054,7 +1147,14 @@ export default function SpaceDetailPage() {
                   : "text-cu-text-secondary hover:text-cu-text"
               )}
             >
-              {tab.label}
+              <span className="flex items-center gap-1.5">
+                {tab.label}
+                {data && tab.count > 0 && (
+                  <span className="rounded-full bg-cu-hover px-1.5 py-0.5 text-[10px] font-medium text-cu-text-secondary">
+                    {tab.count}
+                  </span>
+                )}
+              </span>
               {viewMode === tab.id && (
                 <span
                   className="absolute bottom-0 left-0 right-0 h-0.5 rounded-t-full"
@@ -1063,6 +1163,46 @@ export default function SpaceDetailPage() {
               )}
             </button>
           ))}
+        </div>
+      </div>
+
+      {/* ── Filter bar ──────────────────────────────────────────────────────── */}
+      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-2.5">
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Status filter pills */}
+          <div className="flex items-center gap-1">
+            {(
+              [
+                { id: "all" as const, label: "All" },
+                { id: "open" as const, label: "Open" },
+                { id: "in-progress" as const, label: "In Progress" },
+                { id: "closed" as const, label: "Closed" },
+                { id: "overdue" as const, label: "Overdue" },
+              ] as const
+            ).map((f) => (
+              <button
+                key={f.id}
+                onClick={() => setStatusFilter(f.id)}
+                className={cn(
+                  "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
+                  statusFilter === f.id
+                    ? "bg-cu-purple text-white"
+                    : "bg-cu-hover text-cu-text-secondary hover:text-cu-text"
+                )}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Search */}
+          <input
+            type="text"
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            placeholder="Search tasks…"
+            className="h-7 min-w-[160px] rounded-lg border border-cu-border bg-cu-panel px-2.5 text-[12px] text-cu-text placeholder:text-cu-text-tertiary focus:outline-none focus:ring-1 focus:ring-cu-purple"
+          />
         </div>
       </div>
 
@@ -1083,16 +1223,16 @@ export default function SpaceDetailPage() {
               <ByProjectView
                 folders={data.folders}
                 folderlessLists={data.folderlessLists}
-                byList={data.byList}
+                byList={filteredByList}
               />
             )}
             {viewMode === "person" && (
               <ByPersonView
-                byAssignee={data.byAssignee}
-                unassignedTasks={data.unassignedTasks}
+                byAssignee={filteredByAssignee}
+                unassignedTasks={filteredUnassignedTasks}
               />
             )}
-            {viewMode === "timeline" && <TimelineView tasks={data.tasks} />}
+            {viewMode === "timeline" && <TimelineView tasks={filteredTasks} />}
           </>
         )}
       </div>

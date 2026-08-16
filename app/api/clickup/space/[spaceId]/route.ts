@@ -83,11 +83,12 @@ export async function GET(
   const { spaceId } = await params;
 
   // Phase 1 — parallel: all spaces (for metadata), folders, folderless lists, tasks
+  // subtasks: true ensures subtasks are included in the flat tasks array
   const [spaces, foldersRes, folderlessRes, tasks] = await Promise.all([
     getSpaces(teamId),
     cuGet<{ folders: APIFolder[] }>(`/space/${spaceId}/folder?archived=false`),
     cuGet<{ lists: APIList[] }>(`/space/${spaceId}/list?archived=false`),
-    getTasks(teamId, { include_closed: true, "space_ids[]": spaceId }),
+    getTasks(teamId, { include_closed: true, "space_ids[]": spaceId, subtasks: true }),
   ]);
 
   const spaceObj = spaces.find((s) => s.id === spaceId);
@@ -140,20 +141,31 @@ export async function GET(
     folderId: string | null;
     folderName: string | null;
     tasks: CUTask[];
+    statusCounts: Record<string, number>;
   };
 
   const byList: ByListEntry[] = [];
   const seenListIds = new Set<string>();
 
+  function computeStatusCounts(listTasks: CUTask[]): Record<string, number> {
+    const statusCounts: Record<string, number> = {};
+    for (const t of listTasks) {
+      statusCounts[t.status.type] = (statusCounts[t.status.type] ?? 0) + 1;
+    }
+    return statusCounts;
+  }
+
   // Foldered lists first (ordered by the folders array which preserves API order)
   for (const folder of folders) {
     for (const list of folder.lists) {
+      const listTasks = byListMap.get(list.id) ?? [];
       byList.push({
         listId: list.id,
         listName: list.name,
         folderId: folder.id,
         folderName: folder.name,
-        tasks: byListMap.get(list.id) ?? [],
+        tasks: listTasks,
+        statusCounts: computeStatusCounts(listTasks),
       });
       seenListIds.add(list.id);
     }
@@ -161,12 +173,14 @@ export async function GET(
 
   // Then folderless lists
   for (const list of folderlessLists) {
+    const listTasks = byListMap.get(list.id) ?? [];
     byList.push({
       listId: list.id,
       listName: list.name,
       folderId: null,
       folderName: null,
-      tasks: byListMap.get(list.id) ?? [],
+      tasks: listTasks,
+      statusCounts: computeStatusCounts(listTasks),
     });
     seenListIds.add(list.id);
   }
@@ -181,6 +195,7 @@ export async function GET(
         folderId: ft?.folder.id ?? null,
         folderName: ft?.folder.name ?? null,
         tasks: listTasks,
+        statusCounts: computeStatusCounts(listTasks),
       });
     }
   }
@@ -231,6 +246,52 @@ export async function GET(
   // ── stats ───────────────────────────────────────────────────────────────────
   const now = Date.now();
 
+  // Priority breakdown across all tasks in the space
+  const priorityBreakdown = { urgent: 0, high: 0, normal: 0, low: 0, none: 0 };
+  for (const t of tasks) {
+    const p = t.priority?.priority?.toLowerCase();
+    if (p === "urgent") priorityBreakdown.urgent++;
+    else if (p === "high") priorityBreakdown.high++;
+    else if (p === "normal") priorityBreakdown.normal++;
+    else if (p === "low") priorityBreakdown.low++;
+    else priorityBreakdown.none++;
+  }
+
+  // ── recentActivity ─────────────────────────────────────────────────────────
+  // Top 20 tasks sorted by date_updated descending — powers a "Recent Activity" feed
+  const recentActivity = [...tasks]
+    .sort((a, b) => Number(b.date_updated) - Number(a.date_updated))
+    .slice(0, 20);
+
+  // ── completionTrend ────────────────────────────────────────────────────────
+  // Tasks closed per day for the last 7 days
+  const completionTrend: { date: string; count: number }[] = [];
+  for (let i = 6; i >= 0; i--) {
+    const dayStart = now - i * 86400000;
+    const dayEnd = dayStart + 86400000;
+    const count = tasks.filter(
+      (t) =>
+        t.date_closed &&
+        Number(t.date_closed) >= dayStart &&
+        Number(t.date_closed) < dayEnd
+    ).length;
+    completionTrend.push({
+      date: new Date(dayStart).toISOString().split("T")[0],
+      count,
+    });
+  }
+
+  // ── spaceMembersWithTasks ──────────────────────────────────────────────────
+  // Unique assignees who have tasks in this space, with task counts
+  const spaceMembersWithTasks = Array.from(assigneeMap.values()).map((e) => ({
+    id: e.assigneeId,
+    name: e.assigneeName,
+    email: e.assigneeEmail,
+    color: e.assigneeColor,
+    avatar: e.assigneeAvatar,
+    taskCount: e.tasks.length,
+  }));
+
   return NextResponse.json({
     space: {
       id: spaceObj.id,
@@ -244,6 +305,9 @@ export async function GET(
     byList,
     byAssignee,
     unassignedTasks,
+    recentActivity,
+    completionTrend,
+    spaceMembersWithTasks,
     stats: {
       totalTasks: tasks.length,
       openTasks: tasks.filter((t) => t.status.type === "open").length,
@@ -255,6 +319,7 @@ export async function GET(
       ).length,
       tasksWithDueDates: tasks.filter((t) => t.due_date !== null).length,
       uniqueAssignees: assigneeMap.size,
+      priorityBreakdown,
     },
   });
 }

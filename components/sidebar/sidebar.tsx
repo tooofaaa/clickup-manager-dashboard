@@ -15,6 +15,7 @@ import {
   Ellipsis,
   Folder as FolderIcon,
   FolderOpen,
+  FolderKanban,
   List as ListIcon,
   Settings,
   Bell,
@@ -98,6 +99,12 @@ export function Sidebar({ onCollapse }: { onCollapse?: () => void }) {
           label="Team Evaluation"
           active={pathname === "/team" || pathname.startsWith("/team/")}
           onClick={() => router.push("/team")}
+        />
+        <NavItem
+          icon={<FolderKanban className="h-4 w-4" />}
+          label="Projects"
+          active={pathname === "/projects" || pathname.startsWith("/space/")}
+          onClick={() => router.push("/projects")}
         />
       </nav>
 
