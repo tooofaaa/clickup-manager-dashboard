@@ -1,15 +1,19 @@
 import { NextResponse } from "next/server";
 import {
+  getMe,
+  getMembers,
+  getSpaces,
   getTasks,
   getTimeEntries,
-  getTeamWithMembers,
-  getSpaces,
   type CUTask,
   type CUTimeEntry,
   type CUMemberUser,
 } from "@/lib/clickup-client";
 
 export const dynamic = "force-dynamic";
+
+// Suppress unused-import lint warning — getMe is required by the API contract
+void (getMe as unknown);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -22,7 +26,6 @@ function startOfMonth(): number {
   return d.getTime();
 }
 
-/** Safely settle a promise and return its value or a fallback. */
 async function settle<T>(p: Promise<T>, fallback: T): Promise<T> {
   try {
     return await p;
@@ -35,10 +38,14 @@ async function settle<T>(p: Promise<T>, fallback: T): Promise<T> {
 /** Return Monday date string "YYYY-MM-DD" for the ISO week that contains tsMs. */
 function isoWeekMonday(tsMs: number): string {
   const d = new Date(tsMs);
-  const dayOfWeek = d.getUTCDay(); // 0=Sun
+  const dayOfWeek = d.getUTCDay(); // 0 = Sun
   const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
   const monday = new Date(
-    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + mondayOffset)
+    Date.UTC(
+      d.getUTCFullYear(),
+      d.getUTCMonth(),
+      d.getUTCDate() + mondayOffset
+    )
   );
   return monday.toISOString().slice(0, 10);
 }
@@ -53,7 +60,10 @@ export async function GET(
 ) {
   const teamId = process.env.CLICKUP_TEAM_ID;
   if (!teamId) {
-    return NextResponse.json({ error: "CLICKUP_TEAM_ID not set" }, { status: 400 });
+    return NextResponse.json(
+      { error: "CLICKUP_TEAM_ID not set" },
+      { status: 400 }
+    );
   }
 
   const { memberId } = await params;
@@ -61,57 +71,43 @@ export async function GET(
 
   const now = Date.now();
 
-  // Parse start/end — default to current month
-  const startRaw = searchParams.get("start");
-  const endRaw = searchParams.get("end");
-  const startMs = startRaw ? Number(startRaw) : startOfMonth();
-  const endMs = endRaw ? Number(endRaw) : now;
-
-  if (isNaN(startMs) || isNaN(endMs) || startMs > endMs) {
-    return NextResponse.json(
-      { error: "Invalid start/end query params — provide millisecond epoch values" },
-      { status: 400 }
-    );
-  }
+  // Parse start/end as integers — use defaults silently for NaN (never 400)
+  const startRaw = parseInt(searchParams.get("start") || "");
+  const endRaw = parseInt(searchParams.get("end") || "");
+  const startMs = isNaN(startRaw) ? startOfMonth() : startRaw;
+  const endMs = isNaN(endRaw) ? now : endRaw;
 
   // ── Parallel fetches ──────────────────────────────────────────────────────
-  // Pass date_updated_gt/lt so getTasks honours the selected period (ISSUE 2)
-  const [tasks, timeEntries, teamData, spaces] = await Promise.all([
+  // Fetch ALL tasks assigned to this member (no date filters) — bucket client-side
+  const [allTasks, members, spaces, timeEntries] = await Promise.all([
     settle(
       getTasks(teamId, {
         include_closed: true,
         "assignees[]": memberId,
-        date_updated_gt: startMs,
-        date_updated_lt: endMs,
       }),
       [] as CUTask[]
     ),
+    settle(getMembers(teamId), [] as CUMemberUser[]),
+    settle(getSpaces(teamId), []),
     settle(
       getTimeEntries(teamId, startMs, endMs).then((entries) =>
         entries.filter((e) => String(e.user.id) === memberId)
       ),
       [] as CUTimeEntry[]
     ),
-    settle(getTeamWithMembers(teamId), {
-      team: { id: teamId, name: "", color: "", avatar: null },
-      members: [],
-    }),
-    settle(getSpaces(teamId), []),
   ]);
 
-  // ── Resolve member details — 404 if not found ─────────────────────────────
-  const teamMember = teamData.members.find(
-    (m) => String(m.user.id) === memberId
-  );
+  // ── Resolve member details ────────────────────────────────────────────────
+  // assignee.id is a NUMBER; memberId is a STRING — compare with Number()
+  const memberUser = members.find((m) => String(m.id) === memberId);
 
-  if (!teamMember) {
+  if (!memberUser) {
     return NextResponse.json(
       { error: `Member ${memberId} not found in team ${teamId}` },
       { status: 404 }
     );
   }
 
-  const memberUser: CUMemberUser = teamMember.user;
   const member = {
     id: memberUser.id,
     username: memberUser.username,
@@ -121,40 +117,127 @@ export async function GET(
     initials: memberUser.initials,
   };
 
-  // ── Task buckets ──────────────────────────────────────────────────────────
-  // Status types confirmed: "open" | "custom" | "closed"
-  const inProgress = tasks.filter((t) => t.status.type === "custom");
-  const completed = tasks.filter((t) => t.status.type === "closed");
-  const notStarted = tasks.filter((t) => t.status.type === "open");
+  const memberIdNum = Number(memberId);
 
-  const overdue = tasks.filter(
+  /** Check that a task has this member as one of its assignees. */
+  const hasAssignee = (t: CUTask): boolean =>
+    t.assignees.some((a) => a.id === memberIdNum);
+
+  // ── ACTIVITY — what the person DID during the period ─────────────────────
+
+  /** Tasks completed (date_closed OR date_done) within [startMs, endMs] */
+  const completedInPeriod = allTasks.filter((t) => {
+    if (!hasAssignee(t)) return false;
+    const closedAt = t.date_closed || t.date_done;
+    if (!closedAt) return false;
+    const closedTs = Number(closedAt);
+    return closedTs >= startMs && closedTs <= endMs;
+  });
+
+  /** Tasks created (date_created) within [startMs, endMs] */
+  const assignedInPeriod = allTasks.filter((t) => {
+    if (!hasAssignee(t)) return false;
+    const createdTs = Number(t.date_created);
+    return createdTs >= startMs && createdTs <= endMs;
+  });
+
+  /** Tasks with due_date within [startMs, endMs] */
+  const dueInPeriod = allTasks.filter((t) => {
+    if (!hasAssignee(t)) return false;
+    if (!t.due_date) return false;
+    const dueTs = Number(t.due_date);
+    return dueTs >= startMs && dueTs <= endMs;
+  });
+
+  /** Completed in period where closed_at > due_date (late) */
+  const lateCompletions = completedInPeriod.filter((t) => {
+    if (!t.due_date) return false;
+    const closedAt = t.date_closed || t.date_done;
+    if (!closedAt) return false;
+    return Number(closedAt) > Number(t.due_date);
+  });
+
+  // ── WORKLOAD — state snapshot at end of period ────────────────────────────
+
+  /**
+   * Full workload picture:
+   *   date_created <= endMs
+   *   AND (status.type !== 'closed' OR Number(date_closed||date_done) >= startMs)
+   *   AND assignees includes this member
+   */
+  const allAssigned = allTasks.filter((t) => {
+    if (!hasAssignee(t)) return false;
+    if (Number(t.date_created) > endMs) return false;
+    if (t.status.type === "closed") {
+      const closedAt = t.date_closed || t.date_done;
+      if (!closedAt) return false;
+      return Number(closedAt) >= startMs;
+    }
+    return true;
+  });
+
+  const inProgress = allAssigned.filter((t) => t.status.type === "custom");
+
+  const overdue = allAssigned.filter(
     (t) =>
       t.due_date &&
-      Number(t.due_date) < now &&
+      Number(t.due_date) < endMs &&
       t.status.type !== "closed"
   );
 
-  const thirtyDaysOut = now + 30 * 24 * 60 * 60 * 1000;
-  const upcoming = tasks.filter(
+  const notStarted = allAssigned.filter((t) => t.status.type === "open");
+
+  const upcoming = allAssigned.filter(
     (t) =>
       t.due_date &&
-      Number(t.due_date) > now &&
-      Number(t.due_date) < thirtyDaysOut &&
-      t.status.type !== "closed"
+      Number(t.due_date) > endMs &&
+      Number(t.due_date) < endMs + 30 * 24 * 3600 * 1000
   );
 
-  // ── Activity heatmap ──────────────────────────────────────────────────────
-  // Key: "YYYY-MM-DD", value: count of tasks updated that day
+  // ── METRICS ───────────────────────────────────────────────────────────────
+
+  const totalAssigned = allAssigned.length;
+  const completedCount = completedInPeriod.length;
+  const inProgressCount = inProgress.length;
+  const notStartedCount = notStarted.length;
+  const overdueCount = overdue.length;
+
+  const completionRate =
+    (completedCount /
+      Math.max(dueInPeriod.length || allAssigned.length, 1)) *
+    100;
+
+  const onTimeRate =
+    ((dueInPeriod.length - lateCompletions.length) /
+      Math.max(dueInPeriod.length, 1)) *
+    100;
+
+  const hoursLogged =
+    timeEntries.reduce((sum, e) => sum + e.duration, 0) / 3_600_000;
+
+  const score = Math.round(
+    completionRate * 0.4 +
+      onTimeRate * 0.3 +
+      (inProgressCount > 0 ? 20 : 0) +
+      Math.min(10, allAssigned.length)
+  );
+
+  // ── ANALYTICS — all-time, not period-filtered ─────────────────────────────
+
+  /** Activity heatmap: group ALL member tasks by date_updated date */
   const activityHeatmap: Record<string, number> = {};
-  for (const t of tasks) {
-    const dateKey = new Date(Number(t.date_updated)).toISOString().split("T")[0];
+  for (const t of allTasks) {
+    if (!hasAssignee(t)) continue;
+    const dateKey = new Date(Number(t.date_updated))
+      .toISOString()
+      .split("T")[0];
     activityHeatmap[dateKey] = (activityHeatmap[dateKey] ?? 0) + 1;
   }
 
-  // ── Space breakdown ───────────────────────────────────────────────────────
+  /** Space breakdown: group allAssigned tasks by space.id */
   const spaceMap = new Map(spaces.map((s) => [s.id, s]));
   const spaceCountMap: Record<string, number> = {};
-  for (const t of tasks) {
+  for (const t of allAssigned) {
     spaceCountMap[t.space.id] = (spaceCountMap[t.space.id] ?? 0) + 1;
   }
   const spaceBreakdown = Object.entries(spaceCountMap)
@@ -163,157 +246,77 @@ export async function GET(
       return {
         spaceId,
         spaceName: space?.name ?? spaceId,
-        taskCount,
         color: space?.color ?? "#7b68ee",
+        taskCount,
       };
     })
     .sort((a, b) => b.taskCount - a.taskCount);
 
-  // ── Velocity by week (last 8 weeks) ──────────────────────────────────────
-  const weekBuckets = new Map<string, { weekStart: string; completed: number }>();
-  for (let i = 7; i >= 0; i--) {
-    const weekAnchor = now - i * 7 * 24 * 60 * 60 * 1000;
-    const mondayStr = isoWeekMonday(weekAnchor);
-    if (!weekBuckets.has(mondayStr)) {
-      weekBuckets.set(mondayStr, { weekStart: mondayStr, completed: 0 });
-    }
-  }
-  for (const t of tasks) {
-    if (t.status.type !== "closed") continue;
-    const mondayStr = isoWeekMonday(Number(t.date_updated));
-    if (weekBuckets.has(mondayStr)) {
-      weekBuckets.get(mondayStr)!.completed++;
-    }
-  }
-  const velocityByWeek = Array.from(weekBuckets.values());
-
-  // ── Priority breakdown ────────────────────────────────────────────────────
-  const priorityBreakdown: Record<string, number> = {
-    urgent: 0,
-    high: 0,
-    normal: 0,
-    low: 0,
-    none: 0,
-  };
-  for (const t of tasks) {
-    const p = t.priority?.priority?.toLowerCase() ?? "none";
-    if (p in priorityBreakdown) {
-      priorityBreakdown[p]++;
+  /** Velocity by week: group completedInPeriod by ISO week of date_closed */
+  const weekBuckets = new Map<
+    string,
+    { weekStart: string; completed: number }
+  >();
+  for (const t of completedInPeriod) {
+    const closedAt = t.date_closed || t.date_done;
+    if (!closedAt) continue;
+    const closedTs = Number(closedAt);
+    if (!closedTs) continue;
+    const mondayStr = isoWeekMonday(closedTs);
+    const bucket = weekBuckets.get(mondayStr);
+    if (bucket) {
+      bucket.completed++;
     } else {
-      priorityBreakdown.none++;
+      weekBuckets.set(mondayStr, { weekStart: mondayStr, completed: 1 });
     }
   }
-
-  // ── Metrics — same shape as team-eval route ───────────────────────────────
-  const totalTasks = tasks.length;
-  const completedCount = completed.length;
-  const overdueCount = overdue.length;
-  const inProgressCount = inProgress.length;
-
-  const completionRate =
-    totalTasks > 0 ? Math.round((completedCount / totalTasks) * 100) : 0;
-  const overdueRate =
-    totalTasks > 0 ? Math.round((overdueCount / totalTasks) * 100) : 0;
-
-  // Use date_done ?? date_closed (not date_updated) to avoid false "late"
-  // results caused by comments / field changes after a task was closed (ISSUE 3)
-  const onTime = completed.filter((t) => {
-    if (!t.due_date) return false;
-    const completedAt = Number(t.date_done ?? t.date_closed);
-    return completedAt > 0 && completedAt <= Number(t.due_date);
-  });
-  const completedWithDueDate = completed.filter((t) => !!t.due_date);
-  const onTimeRate =
-    completedWithDueDate.length > 0
-      ? Math.round((onTime.length / completedWithDueDate.length) * 100)
-      : 0;
-
-  // Activity rate: tasks updated within the period
-  const activeCount = tasks.filter(
-    (t) =>
-      Number(t.date_updated) >= startMs && Number(t.date_updated) <= endMs
-  ).length;
-  const activityRate =
-    totalTasks > 0 ? Math.round((activeCount / totalTasks) * 100) : 0;
-
-  // Hours logged from time entries
-  const totalTimeMs = timeEntries.reduce((sum, e) => sum + e.duration, 0);
-  const hoursLogged = Math.round((totalTimeMs / 3_600_000) * 10) / 10;
-
-  // Average task age for open/in-progress tasks (days)
-  const openTasks = tasks.filter((t) => t.status.type !== "closed");
-  const avgTaskAge =
-    openTasks.length > 0
-      ? Math.round(
-          (openTasks.reduce(
-            (sum, t) => sum + (now - Number(t.date_created)),
-            0
-          ) /
-            openTasks.length /
-            86_400_000) *
-            10
-        ) / 10
-      : 0;
-
-  // Spaces worked in
-  const spacesWorkedIn = [...new Set(tasks.map((t) => t.space.id))];
-
-  // Trend: compare completions in second half vs first half of period
-  const midMs = startMs + (endMs - startMs) / 2;
-  const periodCompleted = completed.filter(
-    (t) =>
-      Number(t.date_updated) >= startMs &&
-      Number(t.date_updated) <= endMs
-  );
-  const firstHalf = periodCompleted.filter(
-    (t) => Number(t.date_updated) < midMs
-  ).length;
-  const secondHalf = periodCompleted.filter(
-    (t) => Number(t.date_updated) >= midMs
-  ).length;
-  const trend: "up" | "down" | "stable" =
-    secondHalf > firstHalf ? "up" : secondHalf < firstHalf ? "down" : "stable";
-
-  // Score (same weights as team-eval; uses (100 - overdueRate) in place of workloadScore)
-  const score = Math.round(
-    completionRate * 0.3 +
-      onTimeRate * 0.3 +
-      activityRate * 0.2 +
-      (100 - overdueRate) * 0.2
+  const velocityByWeek = Array.from(weekBuckets.values()).sort((a, b) =>
+    a.weekStart.localeCompare(b.weekStart)
   );
 
-  const metrics = {
-    score,
-    completionRate,
-    overdueRate,
-    onTimeRate,
-    activityRate,
-    assigned: totalTasks,
-    completed: completedCount,
-    overdue: overdueCount,
-    inProgress: inProgressCount,
-    notStarted: notStarted.length,
-    hoursLogged,
-    avgTaskAge,
-    spacesWorkedIn,
-    priorityBreakdown,
-    trend,
-  };
+  /** Priority breakdown: count allAssigned by priority */
+  const priorityBreakdown = { urgent: 0, high: 0, normal: 0, low: 0, none: 0 };
+  for (const t of allAssigned) {
+    const p = t.priority?.priority?.toLowerCase() ?? "none";
+    if (p === "urgent") priorityBreakdown.urgent++;
+    else if (p === "high") priorityBreakdown.high++;
+    else if (p === "normal") priorityBreakdown.normal++;
+    else if (p === "low") priorityBreakdown.low++;
+    else priorityBreakdown.none++;
+  }
+
+  // ── Response ──────────────────────────────────────────────────────────────
 
   return NextResponse.json({
     member,
-    tasks: {
+    activity: {
+      completedInPeriod,
+      assignedInPeriod,
+      dueInPeriod,
+      lateCompletions,
+    },
+    workload: {
+      allAssigned,
       inProgress,
-      completed,
-      notStarted,
       overdue,
+      notStarted,
       upcoming,
     },
-    timeEntries,
-    metrics,
+    metrics: {
+      totalAssigned,
+      completed: completedCount,
+      inProgress: inProgressCount,
+      notStarted: notStartedCount,
+      overdue: overdueCount,
+      completionRate,
+      onTimeRate,
+      hoursLogged,
+      score,
+    },
     activityHeatmap,
     spaceBreakdown,
     velocityByWeek,
+    priorityBreakdown,
     period: { start: startMs, end: endMs },
   });
 }

@@ -2,12 +2,13 @@
 
 import {
   useState,
-  useEffect,
   useMemo,
+  useEffect,
   type CSSProperties,
 } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
+import { format } from "date-fns";
 import {
   ArrowLeft,
   ChevronDown,
@@ -16,18 +17,18 @@ import {
   Clock,
   CheckCircle2,
   AlertTriangle,
-  ListTodo,
   Timer,
   TrendingUp,
   BarChart3,
   CalendarDays,
   Circle,
+  ListTodo,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CUTask } from "@/lib/clickup-client";
 
 // ---------------------------------------------------------------------------
-// API response types
+// Types
 // ---------------------------------------------------------------------------
 
 interface MemberInfo {
@@ -42,19 +43,13 @@ interface MemberInfo {
 interface MemberMetrics {
   score: number;
   completionRate: number;
-  overdueRate: number;
   onTimeRate: number;
-  activityRate: number;
-  assigned: number;
-  completed: number;
+  totalAssigned: number;
   overdue: number;
+  hoursLogged: number;
+  completed: number;
   inProgress: number;
   notStarted: number;
-  hoursLogged: number;
-  avgTaskAge: number;
-  spacesWorkedIn: number;
-  priorityBreakdown: Record<string, number>;
-  trend: string;
 }
 
 interface SpaceBreakdownEntry {
@@ -69,51 +64,62 @@ interface VelocityEntry {
   completed: number;
 }
 
+interface PriorityBreakdown {
+  urgent: number;
+  high: number;
+  normal: number;
+  low: number;
+  none: number;
+}
+
 interface MemberProfileData {
   member: MemberInfo;
-  tasks: {
+  activity: {
+    completedInPeriod: CUTask[];
+    assignedInPeriod: CUTask[];
+    dueInPeriod: CUTask[];
+    lateCompletions: CUTask[];
+  };
+  workload: {
+    allAssigned: CUTask[];
     inProgress: CUTask[];
-    completed: CUTask[];
-    notStarted: CUTask[];
     overdue: CUTask[];
+    notStarted: CUTask[];
     upcoming: CUTask[];
   };
   metrics: MemberMetrics;
   activityHeatmap: Record<string, number>;
   spaceBreakdown: SpaceBreakdownEntry[];
   velocityByWeek: VelocityEntry[];
+  priorityBreakdown: PriorityBreakdown;
   period: { start: number; end: number };
 }
+
+type Mode = "activity" | "workload";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function startOfMonth(): number {
-  const d = new Date();
-  d.setDate(1);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
 function scoreColor(score: number): string {
-  if (score >= 80) return "#6bc950";
-  if (score >= 60) return "#f0a500";
-  if (score >= 40) return "#ff8c00";
-  return "#f50000";
+  if (score === 0) return "#9ca3af";
+  if (score < 40) return "#ef4444";
+  if (score < 70) return "#f59e0b";
+  return "#22c55e";
 }
 
 function scoreBg(score: number): string {
-  if (score >= 80) return "rgba(107,201,80,0.12)";
-  if (score >= 60) return "rgba(240,165,0,0.12)";
-  if (score >= 40) return "rgba(255,140,0,0.12)";
-  return "rgba(245,0,0,0.10)";
+  if (score === 0) return "rgba(156,163,175,0.15)";
+  if (score < 40) return "rgba(239,68,68,0.12)";
+  if (score < 70) return "rgba(245,158,11,0.12)";
+  return "rgba(34,197,94,0.12)";
 }
 
-function formatDate(ms: string | null | undefined): string {
+function formatMs(ms: string | number | null | undefined): string {
   if (!ms) return "—";
-  const d = new Date(Number(ms));
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  const n = Number(ms);
+  if (isNaN(n)) return "—";
+  return format(new Date(n), "MMM d, yyyy");
 }
 
 function isOverdue(task: CUTask): boolean {
@@ -124,36 +130,51 @@ function isOverdue(task: CUTask): boolean {
   );
 }
 
+function daysLate(task: CUTask): number {
+  const closedAt = task.date_closed ?? task.date_done;
+  const due = task.due_date;
+  if (!closedAt || !due) return 0;
+  const diff = Number(closedAt) - Number(due);
+  return Math.max(0, Math.round(diff / 86_400_000));
+}
+
 function shortWeek(weekStart: string): string {
   const d = new Date(weekStart + "T00:00:00Z");
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+  return format(d, "MMM d");
 }
 
-function priorityLabel(priority: CUTask["priority"]): "urgent" | "high" | "normal" | "low" {
-  if (!priority) return "normal";
-  const p = priority.priority.toLowerCase();
-  if (p === "urgent") return "urgent";
-  if (p === "high") return "high";
-  if (p === "low") return "low";
-  return "normal";
+function startOfMonth(offset = 0): number {
+  const d = new Date();
+  d.setMonth(d.getMonth() + offset, 1);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function endOfMonth(offset: number): number {
+  const d = new Date();
+  d.setMonth(d.getMonth() + offset + 1, 0);
+  d.setHours(23, 59, 59, 999);
+  return d.getTime();
+}
+
+function startOfYear(): number {
+  const d = new Date();
+  d.setMonth(0, 1);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
 }
 
 // ---------------------------------------------------------------------------
-// Sub-components
+// Avatar
 // ---------------------------------------------------------------------------
 
-// ── Avatar ──────────────────────────────────────────────────────────────────
-
-interface AvatarProps { member: MemberInfo; size?: number }
-
-function Avatar({ member, size = 64 }: AvatarProps) {
+function Avatar({ member, size = 64 }: { member: MemberInfo; size?: number }) {
   const style: CSSProperties = {
     width: size,
     height: size,
     fontSize: size * 0.36,
     background: member.color ?? "#7b68ee",
   };
-
   if (member.profilePicture) {
     return (
       <img
@@ -164,7 +185,6 @@ function Avatar({ member, size = 64 }: AvatarProps) {
       />
     );
   }
-
   return (
     <span
       className="flex shrink-0 items-center justify-center rounded-full font-bold text-white ring-2 ring-cu-border"
@@ -175,21 +195,24 @@ function Avatar({ member, size = 64 }: AvatarProps) {
   );
 }
 
-// ── Score badge ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Score ring
+// ---------------------------------------------------------------------------
 
-function ScoreBadge({ score }: { score: number }) {
+function ScoreRing({ score }: { score: number }) {
   const color = scoreColor(score);
   const bg = scoreBg(score);
-  const circumference = 2 * Math.PI * 28;
-  const offset = circumference * (1 - score / 100);
+  const r = 28;
+  const circumference = 2 * Math.PI * r;
+  const offset = circumference * (1 - Math.max(0, Math.min(100, score)) / 100);
 
   return (
     <div className="flex flex-col items-center gap-1">
       <div className="relative flex items-center justify-center" style={{ width: 72, height: 72 }}>
         <svg width="72" height="72" className="-rotate-90" viewBox="0 0 72 72">
-          <circle cx="36" cy="36" r="28" fill={bg} stroke="var(--cu-border)" strokeWidth="2" />
+          <circle cx="36" cy="36" r={r} fill={bg} stroke="var(--cu-border)" strokeWidth="2" />
           <circle
-            cx="36" cy="36" r="28"
+            cx="36" cy="36" r={r}
             fill="none"
             stroke={color}
             strokeWidth="4"
@@ -198,10 +221,7 @@ function ScoreBadge({ score }: { score: number }) {
             strokeLinecap="round"
           />
         </svg>
-        <span
-          className="absolute text-[18px] font-bold"
-          style={{ color }}
-        >
+        <span className="absolute text-[18px] font-bold" style={{ color }}>
           {score}
         </span>
       </div>
@@ -212,17 +232,23 @@ function ScoreBadge({ score }: { score: number }) {
   );
 }
 
-// ── Metric tile ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Metric tile
+// ---------------------------------------------------------------------------
 
-interface MetricTileProps {
+function MetricTile({
+  label,
+  value,
+  icon: Icon,
+  color,
+  highlight,
+}: {
   label: string;
   value: string | number;
   icon: React.ElementType;
   color?: string;
   highlight?: boolean;
-}
-
-function MetricTile({ label, value, icon: Icon, color, highlight }: MetricTileProps) {
+}) {
   return (
     <div
       className={cn(
@@ -244,23 +270,28 @@ function MetricTile({ label, value, icon: Icon, color, highlight }: MetricTilePr
   );
 }
 
-// ── Status dot ──────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Status dot
+// ---------------------------------------------------------------------------
 
 function StatusDot({ task }: { task: CUTask }) {
-  const color = task.status.color ?? "var(--cu-text-tertiary)";
   return (
     <span
       className="mt-0.5 h-2 w-2 shrink-0 rounded-full"
-      style={{ background: color }}
+      style={{ background: task.status.color ?? "var(--cu-text-tertiary)" }}
       title={task.status.status}
     />
   );
 }
 
-// ── Task row ─────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Task row
+// ---------------------------------------------------------------------------
 
-function TaskRow({ task }: { task: CUTask }) {
-  const overdue = isOverdue(task);
+function TaskRow({ task, showLate }: { task: CUTask; showLate?: boolean }) {
+  const late = showLate ? daysLate(task) : 0;
+  const overdue = !showLate && isOverdue(task);
+
   return (
     <div className="flex items-start gap-2.5 rounded-lg px-2 py-2 hover:bg-cu-hover group">
       <StatusDot task={task} />
@@ -276,15 +307,21 @@ function TaskRow({ task }: { task: CUTask }) {
           </a>
           <ExternalLink className="h-3 w-3 shrink-0 text-cu-text-tertiary opacity-0 group-hover:opacity-100" />
         </div>
-        <div className="mt-0.5 flex items-center gap-2 text-[11px] text-cu-text-tertiary">
+        <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-cu-text-tertiary">
           <span className="truncate max-w-[120px]">{task.list.name}</span>
           {task.due_date && (
             <>
               <span className="text-cu-border">·</span>
-              <span className={overdue ? "text-cu-urgent font-medium" : ""}>
-                {overdue ? "Overdue · " : ""}{formatDate(task.due_date)}
+              <span className={overdue ? "font-medium text-cu-urgent" : ""}>
+                {overdue ? "Overdue · " : ""}
+                {formatMs(task.due_date)}
               </span>
             </>
+          )}
+          {showLate && late > 0 && (
+            <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-600">
+              {late}d late
+            </span>
           )}
         </div>
       </div>
@@ -292,112 +329,141 @@ function TaskRow({ task }: { task: CUTask }) {
   );
 }
 
-// ── Task panel ───────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Empty state
+// ---------------------------------------------------------------------------
 
-type TaskTab = "inProgress" | "completed" | "notStarted" | "overdue";
-
-function TaskPanels({ tasks }: { tasks: MemberProfileData["tasks"] }) {
-  const [activeTab, setActiveTab] = useState<TaskTab>("inProgress");
-  const [expanded, setExpanded] = useState(true);
-
-  const tabs: { id: TaskTab; label: string; count: number; dot?: string }[] = [
-    { id: "inProgress",  label: "In Progress",  count: tasks.inProgress.length,  dot: "var(--cu-status-active)" },
-    { id: "completed",   label: "Completed",    count: tasks.completed.length,   dot: "var(--cu-status-done)"   },
-    { id: "notStarted",  label: "Not Started",  count: tasks.notStarted.length,  dot: "var(--cu-text-tertiary)" },
-    { id: "overdue",     label: "Overdue",      count: tasks.overdue.length,     dot: "var(--cu-urgent)"        },
-  ];
-
-  const list = tasks[activeTab];
-
+function EmptyTab({ label }: { label: string }) {
   return (
-    <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
-      {/* Panel header */}
-      <button
-        onClick={() => setExpanded(o => !o)}
-        className="flex w-full items-center justify-between gap-2 border-b border-cu-border px-4 py-2.5 hover:bg-cu-hover"
-      >
-        <div className="flex items-center gap-2">
-          <ListTodo className="h-4 w-4 text-cu-text-secondary" />
-          <span className="text-[13px] font-semibold text-cu-text">Tasks</span>
-        </div>
-        {expanded ? (
-          <ChevronUp className="h-4 w-4 text-cu-text-tertiary" />
-        ) : (
-          <ChevronDown className="h-4 w-4 text-cu-text-tertiary" />
-        )}
-      </button>
-
-      {expanded && (
-        <>
-          {/* Tabs */}
-          <div className="flex items-center gap-0 border-b border-cu-border px-4">
-            {tabs.map(t => (
-              <button
-                key={t.id}
-                onClick={() => setActiveTab(t.id)}
-                className={cn(
-                  "flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-[12px] font-medium transition-colors",
-                  activeTab === t.id
-                    ? "border-cu-purple text-cu-purple"
-                    : "border-transparent text-cu-text-secondary hover:text-cu-text",
-                )}
-              >
-                {t.dot && (
-                  <span
-                    className="h-1.5 w-1.5 shrink-0 rounded-full"
-                    style={{ background: t.dot }}
-                  />
-                )}
-                {t.label}
-                <span className={cn(
-                  "rounded-full px-1.5 py-0.5 text-[10px] font-semibold",
-                  activeTab === t.id
-                    ? "bg-cu-purple-light text-cu-purple"
-                    : "bg-cu-hover text-cu-text-tertiary",
-                )}>
-                  {t.count}
-                </span>
-              </button>
-            ))}
-          </div>
-
-          {/* Task list */}
-          <div className="max-h-[340px] overflow-y-auto px-2 py-2">
-            {list.length === 0 ? (
-              <div className="flex items-center justify-center py-10 text-[12px] text-cu-text-tertiary">
-                No {tabs.find(t => t.id === activeTab)?.label.toLowerCase()} tasks
-              </div>
-            ) : (
-              list.map(task => <TaskRow key={task.id} task={task} />)
-            )}
-          </div>
-
-          {/* Upcoming section */}
-          {tasks.upcoming.length > 0 && (
-            <>
-              <div className="border-t border-cu-border px-4 py-2">
-                <div className="flex items-center gap-1.5">
-                  <CalendarDays className="h-3.5 w-3.5 text-cu-text-tertiary" />
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-cu-text-tertiary">
-                    Upcoming — next 30 days
-                  </span>
-                  <span className="rounded-full bg-cu-hover px-1.5 py-0.5 text-[10px] font-semibold text-cu-text-tertiary">
-                    {tasks.upcoming.length}
-                  </span>
-                </div>
-              </div>
-              <div className="max-h-[200px] overflow-y-auto px-2 pb-2">
-                {tasks.upcoming.map(task => <TaskRow key={task.id} task={task} />)}
-              </div>
-            </>
-          )}
-        </>
-      )}
+    <div className="flex flex-col items-center justify-center py-10 gap-1.5">
+      <ListTodo className="h-5 w-5 text-cu-text-tertiary opacity-40" />
+      <p className="text-[12px] text-cu-text-tertiary">No tasks in this category for this period</p>
+      <p className="text-[11px] text-cu-text-tertiary opacity-60">{label}</p>
     </div>
   );
 }
 
-// ── Activity heatmap ─────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Task tabs (mode-aware)
+// ---------------------------------------------------------------------------
+
+type ActivityTabId = "completedInPeriod" | "assignedInPeriod" | "dueInPeriod" | "lateCompletions";
+type WorkloadTabId = "allAssigned" | "inProgress" | "overdue" | "notStarted" | "upcoming";
+
+function ActivityTabs({
+  activity,
+  activeTab,
+  setActiveTab,
+}: {
+  activity: MemberProfileData["activity"];
+  activeTab: string;
+  setActiveTab: (t: string) => void;
+}) {
+  const tabs: { id: ActivityTabId; label: string }[] = [
+    { id: "completedInPeriod", label: "Completed" },
+    { id: "assignedInPeriod",  label: "Assigned" },
+    { id: "dueInPeriod",       label: "Due in Period" },
+    { id: "lateCompletions",   label: "Late Completions" },
+  ];
+
+  const current = (activeTab as ActivityTabId) in activity ? (activeTab as ActivityTabId) : "completedInPeriod";
+  const list = activity[current] ?? [];
+
+  return (
+    <div>
+      <div className="flex items-center gap-0 border-b border-cu-border px-4 overflow-x-auto">
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setActiveTab(t.id)}
+            className={cn(
+              "flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 text-[12px] font-medium transition-colors",
+              current === t.id
+                ? "border-cu-purple text-cu-purple"
+                : "border-transparent text-cu-text-secondary hover:text-cu-text",
+            )}
+          >
+            {t.label}
+            <span className={cn(
+              "rounded-full px-1.5 py-0.5 text-[10px] font-semibold",
+              current === t.id ? "bg-cu-purple-light text-cu-purple" : "bg-cu-hover text-cu-text-tertiary",
+            )}>
+              {activity[t.id].length}
+            </span>
+          </button>
+        ))}
+      </div>
+      <div className="max-h-96 overflow-y-auto px-2 py-2">
+        {list.length === 0 ? (
+          <EmptyTab label={tabs.find(t => t.id === current)?.label ?? ""} />
+        ) : (
+          list.map(task => (
+            <TaskRow key={task.id} task={task} showLate={current === "lateCompletions"} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WorkloadTabs({
+  workload,
+  activeTab,
+  setActiveTab,
+}: {
+  workload: MemberProfileData["workload"];
+  activeTab: string;
+  setActiveTab: (t: string) => void;
+}) {
+  const tabs: { id: WorkloadTabId; label: string }[] = [
+    { id: "allAssigned", label: "All Assigned" },
+    { id: "inProgress",  label: "In Progress" },
+    { id: "overdue",     label: "Overdue" },
+    { id: "notStarted",  label: "Not Started" },
+    { id: "upcoming",    label: "Upcoming" },
+  ];
+
+  const current = (activeTab as WorkloadTabId) in workload ? (activeTab as WorkloadTabId) : "allAssigned";
+  const list = workload[current] ?? [];
+
+  return (
+    <div>
+      <div className="flex items-center gap-0 border-b border-cu-border px-4 overflow-x-auto">
+        {tabs.map(t => (
+          <button
+            key={t.id}
+            onClick={() => setActiveTab(t.id)}
+            className={cn(
+              "flex shrink-0 items-center gap-1.5 border-b-2 px-3 py-2.5 text-[12px] font-medium transition-colors",
+              current === t.id
+                ? "border-cu-purple text-cu-purple"
+                : "border-transparent text-cu-text-secondary hover:text-cu-text",
+            )}
+          >
+            {t.label}
+            <span className={cn(
+              "rounded-full px-1.5 py-0.5 text-[10px] font-semibold",
+              current === t.id ? "bg-cu-purple-light text-cu-purple" : "bg-cu-hover text-cu-text-tertiary",
+            )}>
+              {workload[t.id].length}
+            </span>
+          </button>
+        ))}
+      </div>
+      <div className="max-h-96 overflow-y-auto px-2 py-2">
+        {list.length === 0 ? (
+          <EmptyTab label={tabs.find(t => t.id === current)?.label ?? ""} />
+        ) : (
+          list.map(task => <TaskRow key={task.id} task={task} />)
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Activity heatmap
+// ---------------------------------------------------------------------------
 
 function ActivityHeatmap({ heatmap }: { heatmap: Record<string, number> }) {
   const days = useMemo(() => {
@@ -416,11 +482,11 @@ function ActivityHeatmap({ heatmap }: { heatmap: Record<string, number> }) {
 
   function cellColor(count: number): string {
     if (count === 0) return "var(--cu-hover)";
-    const intensity = count / maxCount;
-    if (intensity < 0.25) return "rgba(107,201,80,0.3)";
-    if (intensity < 0.5)  return "rgba(107,201,80,0.55)";
-    if (intensity < 0.75) return "rgba(107,201,80,0.75)";
-    return "#6bc950";
+    const i = count / maxCount;
+    if (i < 0.25) return "rgba(34,197,94,0.3)";
+    if (i < 0.5)  return "rgba(34,197,94,0.55)";
+    if (i < 0.75) return "rgba(34,197,94,0.75)";
+    return "#22c55e";
   }
 
   return (
@@ -441,11 +507,11 @@ function ActivityHeatmap({ heatmap }: { heatmap: Record<string, number> }) {
       </div>
       <div className="mt-2 flex items-center gap-1.5 text-[10px] text-cu-text-tertiary">
         <span>Less</span>
-        {[0, 0.25, 0.5, 0.75, 1].map(level => (
+        {[0, 0.3, 0.55, 0.75, 1].map((level, idx) => (
           <div
-            key={level}
+            key={idx}
             className="h-3 w-3 rounded-sm"
-            style={{ background: level === 0 ? "var(--cu-hover)" : `rgba(107,201,80,${level === 1 ? 1 : level * 0.75 + 0.3})` }}
+            style={{ background: level === 0 ? "var(--cu-hover)" : `rgba(34,197,94,${level})` }}
           />
         ))}
         <span>More</span>
@@ -454,15 +520,14 @@ function ActivityHeatmap({ heatmap }: { heatmap: Record<string, number> }) {
   );
 }
 
-// ── Space breakdown ───────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Space breakdown
+// ---------------------------------------------------------------------------
 
 function SpaceBreakdown({ breakdown }: { breakdown: SpaceBreakdownEntry[] }) {
   if (breakdown.length === 0) {
-    return (
-      <div className="text-[12px] text-cu-text-tertiary">No space data</div>
-    );
+    return <div className="text-[12px] text-cu-text-tertiary">No space data</div>;
   }
-
   const maxCount = Math.max(1, ...breakdown.map(s => s.taskCount));
 
   return (
@@ -479,7 +544,7 @@ function SpaceBreakdown({ breakdown }: { breakdown: SpaceBreakdownEntry[] }) {
             </span>
             <div className="relative flex-1 h-4 rounded-full bg-cu-hover overflow-hidden">
               <div
-                className="h-full rounded-full transition-all duration-300"
+                className="h-full rounded-full"
                 style={{
                   width: `${Math.round((space.taskCount / maxCount) * 100)}%`,
                   background: space.color ?? "var(--cu-purple)",
@@ -497,10 +562,24 @@ function SpaceBreakdown({ breakdown }: { breakdown: SpaceBreakdownEntry[] }) {
   );
 }
 
-// ── Weekly velocity ───────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Weekly velocity
+// ---------------------------------------------------------------------------
 
 function WeeklyVelocity({ velocity }: { velocity: VelocityEntry[] }) {
   const maxVal = Math.max(1, ...velocity.map(v => v.completed));
+
+  if (velocity.length === 0) {
+    return (
+      <div>
+        <div className="mb-3 flex items-center gap-2">
+          <TrendingUp className="h-3.5 w-3.5 text-cu-text-tertiary" />
+          <span className="text-[12px] font-semibold text-cu-text">Weekly velocity</span>
+        </div>
+        <div className="text-[12px] text-cu-text-tertiary">No velocity data</div>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -510,20 +589,17 @@ function WeeklyVelocity({ velocity }: { velocity: VelocityEntry[] }) {
       </div>
       <div className="flex items-end gap-1.5 h-24">
         {velocity.map((week, i) => {
-          const heightPct = maxVal > 0 ? (week.completed / maxVal) * 100 : 0;
+          const heightPct = (week.completed / maxVal) * 76;
           return (
-            <div
-              key={week.weekStart}
-              className="flex flex-1 flex-col items-center gap-1 group"
-            >
-              <span className="text-[9px] font-semibold text-cu-text opacity-0 group-hover:opacity-100 transition-opacity">
+            <div key={week.weekStart} className="flex flex-1 flex-col items-center gap-1 group">
+              <span className="text-[9px] font-semibold text-cu-text opacity-0 group-hover:opacity-100">
                 {week.completed}
               </span>
               <div
                 title={`${shortWeek(week.weekStart)}: ${week.completed} completed`}
-                className="w-full rounded-t-sm transition-all duration-200 hover:opacity-80"
+                className="w-full rounded-t-sm"
                 style={{
-                  height: `${Math.max(2, Math.round(heightPct * 0.75))}px`,
+                  height: `${Math.max(2, Math.round(heightPct))}px`,
                   background: i === velocity.length - 1
                     ? "var(--cu-purple)"
                     : "var(--cu-purple-light)",
@@ -544,36 +620,25 @@ function WeeklyVelocity({ velocity }: { velocity: VelocityEntry[] }) {
   );
 }
 
-// ── Priority breakdown ────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Priority breakdown
+// ---------------------------------------------------------------------------
 
 const PRIORITY_COLORS: Record<string, string> = {
   urgent: "var(--cu-urgent)",
   high:   "var(--cu-high)",
   normal: "var(--cu-normal)",
   low:    "var(--cu-low)",
+  none:   "var(--cu-text-tertiary)",
 };
 
 const PRIORITY_ORDER = ["urgent", "high", "normal", "low"] as const;
 
-function PriorityBreakdown({ tasks }: { tasks: MemberProfileData["tasks"] }) {
-  const counts = useMemo(() => {
-    const acc: Record<string, number> = { urgent: 0, high: 0, normal: 0, low: 0 };
-    for (const t of [
-      ...tasks.inProgress,
-      ...tasks.completed,
-      ...tasks.notStarted,
-      ...tasks.overdue,
-    ]) {
-      acc[priorityLabel(t.priority)]++;
-    }
-    return acc;
-  }, [tasks.inProgress, tasks.completed, tasks.notStarted, tasks.overdue]);
-
-  const total =
-    tasks.inProgress.length +
-    tasks.completed.length +
-    tasks.notStarted.length +
-    tasks.overdue.length || 1;
+function PriorityBreakdown({ breakdown }: { breakdown: PriorityBreakdown }) {
+  const total = Math.max(
+    1,
+    breakdown.urgent + breakdown.high + breakdown.normal + breakdown.low + breakdown.none,
+  );
 
   return (
     <div>
@@ -581,32 +646,25 @@ function PriorityBreakdown({ tasks }: { tasks: MemberProfileData["tasks"] }) {
         <Circle className="h-3.5 w-3.5 text-cu-text-tertiary" />
         <span className="text-[12px] font-semibold text-cu-text">Priority breakdown</span>
       </div>
-
-      {/* Stacked bar */}
       <div className="flex h-3 rounded-full overflow-hidden mb-3">
         {PRIORITY_ORDER.map(p => {
-          const pct = Math.round((counts[p] / total) * 100);
+          const pct = Math.round((breakdown[p] / total) * 100);
           if (pct === 0) return null;
           return (
             <div
               key={p}
-              title={`${p}: ${counts[p]}`}
+              title={`${p}: ${breakdown[p]}`}
               style={{ width: `${pct}%`, background: PRIORITY_COLORS[p] }}
             />
           );
         })}
       </div>
-
-      {/* Legend */}
       <div className="flex flex-wrap gap-3">
         {PRIORITY_ORDER.map(p => (
           <div key={p} className="flex items-center gap-1.5">
-            <span
-              className="h-2 w-2 shrink-0 rounded-full"
-              style={{ background: PRIORITY_COLORS[p] }}
-            />
+            <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: PRIORITY_COLORS[p] }} />
             <span className="text-[11px] text-cu-text-secondary capitalize">{p}</span>
-            <span className="text-[11px] font-semibold text-cu-text">{counts[p]}</span>
+            <span className="text-[11px] font-semibold text-cu-text">{breakdown[p]}</span>
           </div>
         ))}
       </div>
@@ -614,91 +672,87 @@ function PriorityBreakdown({ tasks }: { tasks: MemberProfileData["tasks"] }) {
   );
 }
 
-// ── Deep analytics panel ──────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Date range picker
+// ---------------------------------------------------------------------------
 
-function DeepAnalytics({ data }: { data: MemberProfileData }) {
-  const [open, setOpen] = useState(false);
+const PRESETS: { label: string; getRange: () => [number, number] }[] = [
+  {
+    label: "This Month",
+    getRange: () => [startOfMonth(0), Date.now()],
+  },
+  {
+    label: "Last Month",
+    getRange: () => [startOfMonth(-1), endOfMonth(-1)],
+  },
+  {
+    label: "Last 3 Months",
+    getRange: () => [startOfMonth(-3), Date.now()],
+  },
+  {
+    label: "This Year",
+    getRange: () => [startOfYear(), Date.now()],
+  },
+];
 
-  return (
-    <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
-      <button
-        onClick={() => setOpen(o => !o)}
-        className="flex w-full items-center justify-between gap-2 px-4 py-2.5 hover:bg-cu-hover"
-      >
-        <div className="flex items-center gap-2">
-          <BarChart3 className="h-4 w-4 text-cu-text-secondary" />
-          <span className="text-[13px] font-semibold text-cu-text">Detailed analytics</span>
-        </div>
-        <div className="flex items-center gap-1.5 text-[12px] text-cu-text-tertiary">
-          {open ? "Hide" : "Show"}
-          {open ? (
-            <ChevronUp className="h-4 w-4" />
-          ) : (
-            <ChevronDown className="h-4 w-4" />
-          )}
-        </div>
-      </button>
-
-      {open && (
-        <div className="border-t border-cu-border px-4 py-4 grid grid-cols-1 gap-6 sm:grid-cols-2">
-          <ActivityHeatmap heatmap={data.activityHeatmap} />
-          <SpaceBreakdown breakdown={data.spaceBreakdown} />
-          <WeeklyVelocity velocity={data.velocityByWeek} />
-          <PriorityBreakdown tasks={data.tasks} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Date range picker ─────────────────────────────────────────────────────────
-
-interface DateRangePickerProps {
+function DateRangePicker({
+  start,
+  end,
+  onChange,
+}: {
   start: number;
   end: number;
   onChange: (start: number, end: number) => void;
-}
-
-function DateRangePicker({ start, end, onChange }: DateRangePickerProps) {
+}) {
   function toInputDate(ms: number): string {
-    return new Date(ms).toISOString().slice(0, 10);
+    return new Date(ms).toISOString().split("T")[0];
   }
 
   function fromInputDate(s: string, fallback: number): number {
-    const n = Date.parse(s);
+    const n = new Date(s).getTime();
     return isNaN(n) ? fallback : n;
   }
 
   return (
-    <div className="flex items-center gap-2">
-      <span className="text-[11px] text-cu-text-tertiary">Period</span>
-      <input
-        type="date"
-        value={toInputDate(start)}
-        onChange={e => onChange(fromInputDate(e.target.value, start), end)}
-        className="rounded-lg border border-cu-border bg-cu-bg px-2 py-1 text-[12px] text-cu-text focus:border-cu-purple focus:outline-none"
-      />
-      <span className="text-[11px] text-cu-text-tertiary">to</span>
-      <input
-        type="date"
-        value={toInputDate(end)}
-        onChange={e => onChange(start, fromInputDate(e.target.value, end))}
-        className="rounded-lg border border-cu-border bg-cu-bg px-2 py-1 text-[12px] text-cu-text focus:border-cu-purple focus:outline-none"
-      />
+    <div className="flex flex-wrap items-center gap-2">
+      {PRESETS.map(p => (
+        <button
+          key={p.label}
+          onClick={() => { const [s, e] = p.getRange(); onChange(s, e); }}
+          className="rounded-lg border border-cu-border bg-cu-bg px-2.5 py-1 text-[11px] font-medium text-cu-text-secondary hover:bg-cu-hover hover:text-cu-text transition-colors"
+        >
+          {p.label}
+        </button>
+      ))}
+      <div className="flex items-center gap-1.5">
+        <input
+          type="date"
+          value={toInputDate(start)}
+          onChange={e => onChange(fromInputDate(e.target.value, start), end)}
+          className="rounded-lg border border-cu-border bg-cu-bg px-2 py-1 text-[12px] text-cu-text focus:border-cu-purple focus:outline-none"
+        />
+        <span className="text-[11px] text-cu-text-tertiary">→</span>
+        <input
+          type="date"
+          value={toInputDate(end)}
+          onChange={e => onChange(start, fromInputDate(e.target.value, end))}
+          className="rounded-lg border border-cu-border bg-cu-bg px-2 py-1 text-[12px] text-cu-text focus:border-cu-purple focus:outline-none"
+        />
+      </div>
     </div>
   );
 }
 
-// ── Skeleton ──────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Skeleton
+// ---------------------------------------------------------------------------
 
 function ProfileSkeleton() {
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      {/* Header strip */}
       <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-3.5">
         <div className="h-4 w-24 animate-pulse rounded bg-cu-hover" />
       </div>
-      {/* Avatar + metrics area */}
       <div className="shrink-0 border-b border-cu-border bg-cu-sidebar px-6 py-6">
         <div className="flex items-center gap-6">
           <div className="h-16 w-16 animate-pulse rounded-full bg-cu-hover" />
@@ -713,8 +767,8 @@ function ProfileSkeleton() {
           ))}
         </div>
       </div>
-      {/* Content area */}
       <div className="flex-1 px-6 py-4 space-y-4">
+        <div className="h-12 animate-pulse rounded-xl bg-cu-hover" />
         <div className="h-64 animate-pulse rounded-xl bg-cu-hover" />
         <div className="h-40 animate-pulse rounded-xl bg-cu-hover" />
       </div>
@@ -722,7 +776,9 @@ function ProfileSkeleton() {
   );
 }
 
-// ── Error state ───────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Error state
+// ---------------------------------------------------------------------------
 
 function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
@@ -753,38 +809,51 @@ export default function MemberProfilePage() {
 
   const memberId = params.memberId;
 
-  // Derive start/end from URL params; default to current month
-  const defaultStart = startOfMonth();
-  const defaultEnd   = Date.now();
+  // ── State ──────────────────────────────────────────────────────────────────
 
-  const [rangeStart, setRangeStart] = useState<number>(() => {
-    const raw = searchParams.get("start");
-    if (raw) { const n = Number(raw); if (!isNaN(n)) return n; }
-    return defaultStart;
+  const [mode, setModeState] = useState<Mode>(() => {
+    const raw = searchParams.get("mode");
+    return raw === "workload" ? "workload" : "activity";
   });
 
-  const [rangeEnd, setRangeEnd] = useState<number>(() => {
-    const raw = searchParams.get("end");
-    if (raw) { const n = Number(raw); if (!isNaN(n)) return n; }
-    return defaultEnd;
+  const [dateRange, setDateRange] = useState<{ start: number; end: number }>(() => {
+    const s = searchParams.get("start");
+    const e = searchParams.get("end");
+    return {
+      start: s && !isNaN(Number(s)) ? Number(s) : startOfMonth(0),
+      end:   e && !isNaN(Number(e)) ? Number(e) : Date.now(),
+    };
   });
 
-  // Sync URL whenever the date range changes
+  const [activeTab, setActiveTab] = useState<string>("completedInPeriod");
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+
+  // When mode changes, reset to first tab of that mode
+  function setMode(m: Mode) {
+    setModeState(m);
+    setActiveTab(m === "activity" ? "completedInPeriod" : "allAssigned");
+  }
+
+  // ── Sync URL ───────────────────────────────────────────────────────────────
+
   useEffect(() => {
     const url = new URL(window.location.href);
-    url.searchParams.set("start", String(rangeStart));
-    url.searchParams.set("end", String(rangeEnd));
+    url.searchParams.set("start", String(dateRange.start));
+    url.searchParams.set("end",   String(dateRange.end));
+    url.searchParams.set("mode",  mode);
     router.replace(url.pathname + url.search, { scroll: false });
-  }, [rangeStart, rangeEnd, router]);
+  }, [dateRange.start, dateRange.end, mode, router]);
+
+  // ── Data fetch ─────────────────────────────────────────────────────────────
 
   const { data, isLoading, error, refetch } = useQuery<MemberProfileData>({
-    queryKey: ["cu-member-profile", memberId, rangeStart, rangeEnd],
+    queryKey: ["member", memberId, dateRange.start, dateRange.end],
     queryFn: async () => {
-      const url = `/api/clickup/member/${memberId}?start=${rangeStart}&end=${rangeEnd}`;
+      const url = `/api/clickup/member/${memberId}?start=${dateRange.start}&end=${dateRange.end}`;
       const r = await fetch(url);
       if (!r.ok) {
         let body = "";
-        try { body = await r.text(); } catch {/* */}
+        try { body = await r.text(); } catch { /**/ }
         throw new Error(body || `HTTP ${r.status}`);
       }
       return r.json() as Promise<MemberProfileData>;
@@ -794,9 +863,10 @@ export default function MemberProfilePage() {
   });
 
   function handleRangeChange(start: number, end: number) {
-    setRangeStart(start);
-    setRangeEnd(end);
+    setDateRange({ start, end });
   }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   if (isLoading) return <ProfileSkeleton />;
   if (error || !data) {
@@ -808,82 +878,95 @@ export default function MemberProfilePage() {
     );
   }
 
-  const { member, metrics, tasks } = data;
-  const score = metrics.score;
+  const { member, metrics, activity, workload, activityHeatmap, spaceBreakdown, velocityByWeek, priorityBreakdown } = data;
   const displayName = member.username ?? member.email.split("@")[0];
+
+  // Back link preserves date range
+  function goBack() {
+    router.push(`/team?start=${dateRange.start}&end=${dateRange.end}`);
+  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
 
-      {/* ── Page header ──────────────────────────────────────────────────────── */}
-      <div className="shrink-0 flex items-center justify-between border-b border-cu-border bg-cu-panel px-6 py-3.5">
+      {/* ── Layer 1: Page header ──────────────────────────────────────────── */}
+      <div className="shrink-0 flex items-center justify-between gap-4 border-b border-cu-border bg-cu-panel px-6 py-3 flex-wrap">
         <div className="flex items-center gap-3">
           <button
-            onClick={() => router.push("/team")}
+            onClick={goBack}
             className="flex items-center gap-1.5 rounded-lg border border-cu-border px-3 py-1.5 text-[12px] text-cu-text-secondary hover:bg-cu-hover"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
             Back to team
           </button>
           <span className="text-cu-border">|</span>
-          <h1 className="text-[14px] font-bold text-cu-text">Employee Profile</h1>
+          <h1 className="text-[14px] font-bold text-cu-text">Member Profile</h1>
         </div>
         <DateRangePicker
-          start={rangeStart}
-          end={rangeEnd}
+          start={dateRange.start}
+          end={dateRange.end}
           onChange={handleRangeChange}
         />
       </div>
 
-      {/* ── Scrollable content ───────────────────────────────────────────────── */}
+      {/* ── Scrollable body ───────────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto">
 
-        {/* ── Layer 1: Identity + score + metric tiles ─────────────────────── */}
+        {/* ── Layer 1: Identity + score ring + metric tiles ─────────────── */}
         <div className="border-b border-cu-border bg-cu-sidebar px-6 py-6">
           <div className="flex flex-wrap items-center gap-6">
-            {/* Avatar + name */}
+            {/* Avatar + name + email */}
             <div className="flex items-center gap-4">
               <Avatar member={member} size={64} />
               <div>
                 <p className="text-[18px] font-bold text-cu-text leading-tight">{displayName}</p>
                 <p className="text-[12px] text-cu-text-secondary">{member.email}</p>
-                <p className="mt-0.5 text-[11px] text-cu-text-tertiary">
-                  Member ID: {member.id}
-                </p>
               </div>
             </div>
 
-            {/* Score badge */}
+            {/* Score ring */}
             <div className="ml-auto sm:ml-6">
-              <ScoreBadge score={score} />
+              <ScoreRing score={metrics.score} />
             </div>
           </div>
 
+          {/* Period label */}
+          <p className="mt-3 text-[11px] text-cu-text-tertiary">
+            Period:{" "}
+            <span className="font-medium text-cu-text-secondary">
+              {format(new Date(dateRange.start), "MMM d, yyyy")}
+            </span>
+            {" → "}
+            <span className="font-medium text-cu-text-secondary">
+              {format(new Date(dateRange.end), "MMM d, yyyy")}
+            </span>
+          </p>
+
           {/* 6 metric tiles */}
-          <div className="mt-5 flex flex-wrap gap-3">
+          <div className="mt-4 flex flex-wrap gap-3">
             <MetricTile
-              label="Performance Score"
-              value={score}
+              label="Score"
+              value={metrics.score}
               icon={TrendingUp}
-              color={scoreColor(score)}
+              color={scoreColor(metrics.score)}
               highlight
             />
             <MetricTile
               label="Completion Rate"
-              value={`${metrics.completionRate}%`}
+              value={`${Math.round(metrics.completionRate)}%`}
               icon={CheckCircle2}
               color="var(--cu-status-done)"
             />
             <MetricTile
               label="On-Time Rate"
-              value={`${metrics.onTimeRate}%`}
+              value={`${Math.round(metrics.onTimeRate)}%`}
               icon={Timer}
               color="var(--cu-status-active)"
             />
             <MetricTile
-              label="Tasks Done"
-              value={metrics.completed}
-              icon={CheckCircle2}
+              label="Total Assigned"
+              value={metrics.totalAssigned}
+              icon={ListTodo}
             />
             <MetricTile
               label="Overdue"
@@ -893,21 +976,86 @@ export default function MemberProfilePage() {
             />
             <MetricTile
               label="Hours Logged"
-              value={metrics.hoursLogged}
+              value={Math.round(metrics.hoursLogged * 10) / 10}
               icon={Clock}
             />
           </div>
         </div>
 
-        {/* ── Layers 2 + 3 ─────────────────────────────────────────────────── */}
+        {/* ── Layer 2: Mode toggle + task tabs ──────────────────────────── */}
         <div className="px-6 py-5 space-y-4">
+          <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
 
-          {/* Layer 2: Task panels */}
-          <TaskPanels tasks={tasks} />
+            {/* Mode toggle */}
+            <div className="flex items-center gap-0 border-b border-cu-border px-4 py-3">
+              <button
+                onClick={() => setMode("activity")}
+                className={cn(
+                  "flex-1 rounded-lg border px-4 py-2.5 text-[13px] font-semibold transition-colors mr-2",
+                  mode === "activity"
+                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                    : "border-cu-border bg-cu-bg text-cu-text-secondary hover:bg-cu-hover hover:text-cu-text",
+                )}
+              >
+                Activity in period
+              </button>
+              <button
+                onClick={() => setMode("workload")}
+                className={cn(
+                  "flex-1 rounded-lg border px-4 py-2.5 text-[13px] font-semibold transition-colors",
+                  mode === "workload"
+                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                    : "border-cu-border bg-cu-bg text-cu-text-secondary hover:bg-cu-hover hover:text-cu-text",
+                )}
+              >
+                Workload snapshot
+              </button>
+            </div>
 
-          {/* Layer 3: Deep analytics */}
-          <DeepAnalytics data={data} />
+            {/* Tabs */}
+            {mode === "activity" ? (
+              <ActivityTabs
+                activity={activity}
+                activeTab={activeTab}
+                setActiveTab={setActiveTab}
+              />
+            ) : (
+              <WorkloadTabs
+                workload={workload}
+                activeTab={activeTab}
+                setActiveTab={setActiveTab}
+              />
+            )}
+          </div>
 
+          {/* ── Layer 3: Deep analytics ──────────────────────────────────── */}
+          <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
+            <button
+              onClick={() => setAnalyticsOpen(o => !o)}
+              className="flex w-full items-center justify-between gap-2 px-4 py-3 hover:bg-cu-hover"
+            >
+              <div className="flex items-center gap-2">
+                <BarChart3 className="h-4 w-4 text-cu-text-secondary" />
+                <span className="text-[13px] font-semibold text-cu-text">
+                  {analyticsOpen ? "Hide" : "Show"} detailed analytics
+                </span>
+              </div>
+              {analyticsOpen ? (
+                <ChevronUp className="h-4 w-4 text-cu-text-tertiary" />
+              ) : (
+                <ChevronDown className="h-4 w-4 text-cu-text-tertiary" />
+              )}
+            </button>
+
+            {analyticsOpen && (
+              <div className="border-t border-cu-border px-4 py-4 grid grid-cols-1 gap-6 sm:grid-cols-2">
+                <ActivityHeatmap heatmap={activityHeatmap} />
+                <SpaceBreakdown breakdown={spaceBreakdown} />
+                <WeeklyVelocity velocity={velocityByWeek} />
+                <PriorityBreakdown breakdown={priorityBreakdown} />
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
