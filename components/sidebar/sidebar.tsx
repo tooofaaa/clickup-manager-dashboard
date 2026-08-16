@@ -99,7 +99,6 @@ export function Sidebar({ onCollapse }: { onCollapse?: () => void }) {
           active={pathname === "/team" || pathname.startsWith("/team/")}
           onClick={() => router.push("/team")}
         />
-        <NavItem icon={<LayoutGrid className="h-4 w-4" />} label="Views" />
       </nav>
 
       {favLists.length > 0 && (
@@ -266,11 +265,13 @@ function UserSwitcher() {
 
 function SpaceItem({ space }: { space: SpaceNode }) {
   const router = useRouter();
+  const pathname = usePathname();
   const { createList, createFolder, rename, remove } = useHierarchy();
   const [open, setOpen] = useState(true);
   const [creating, setCreating] = useState<"list" | "folder" | null>(null);
   const [renaming, setRenaming] = useState(false);
   const hasChildren = space.folders.length > 0 || space.lists.length > 0;
+  const spaceActive = pathname.startsWith("/space/" + space.id);
 
   if (renaming) {
     return (
@@ -305,6 +306,8 @@ function SpaceItem({ space }: { space: SpaceNode }) {
         }
         label={space.name}
         bold
+        active={spaceActive}
+        onSpaceClick={() => router.push(`/space/${space.id}`)}
         onRename={() => setRenaming(true)}
         onDelete={() => remove.mutate({ kind: "spaces", id: space.id })}
         addMenu={
@@ -471,6 +474,8 @@ function Row({
   leading,
   label,
   bold,
+  active,
+  onSpaceClick,
   onRename,
   onDelete,
   onAdd,
@@ -483,6 +488,8 @@ function Row({
   leading: React.ReactNode;
   label: string;
   bold?: boolean;
+  active?: boolean;
+  onSpaceClick?: () => void;
   onRename?: () => void;
   onDelete?: () => void;
   onAdd?: () => void;
@@ -490,13 +497,16 @@ function Row({
 }) {
   return (
     <div
-      className="group flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-[13px] text-cu-text hover:bg-cu-hover-strong"
+      className={cn(
+        "group flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-[13px] text-cu-text hover:bg-cu-hover-strong",
+        active && "bg-cu-sidebar-active font-medium",
+      )}
       style={{ paddingLeft: depth * 14 + 4 }}
     >
       <button onClick={onToggle} className="flex h-4 w-4 items-center justify-center text-cu-text-tertiary">
         {hasChildren ? (open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />) : null}
       </button>
-      <button onClick={onToggle} onDoubleClick={onRename} className="flex min-w-0 flex-1 items-center gap-1.5">
+      <button onClick={onSpaceClick ?? onToggle} onDoubleClick={onRename} className="flex min-w-0 flex-1 items-center gap-1.5">
         {leading}
         <span className={cn("truncate", bold && "font-semibold")}>{label}</span>
       </button>
