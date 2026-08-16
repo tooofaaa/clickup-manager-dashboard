@@ -75,11 +75,14 @@ export async function GET(
   }
 
   // ── Parallel fetches ──────────────────────────────────────────────────────
+  // Pass date_updated_gt/lt so getTasks honours the selected period (ISSUE 2)
   const [tasks, timeEntries, teamData, spaces] = await Promise.all([
     settle(
       getTasks(teamId, {
         include_closed: true,
         "assignees[]": memberId,
+        date_updated_gt: startMs,
+        date_updated_lt: endMs,
       }),
       [] as CUTask[]
     ),
@@ -212,9 +215,13 @@ export async function GET(
   const overdueRate =
     totalTasks > 0 ? Math.round((overdueCount / totalTasks) * 100) : 0;
 
-  const onTime = completed.filter(
-    (t) => t.due_date && Number(t.date_updated) <= Number(t.due_date)
-  );
+  // Use date_done ?? date_closed (not date_updated) to avoid false "late"
+  // results caused by comments / field changes after a task was closed (ISSUE 3)
+  const onTime = completed.filter((t) => {
+    if (!t.due_date) return false;
+    const completedAt = Number(t.date_done ?? t.date_closed);
+    return completedAt > 0 && completedAt <= Number(t.due_date);
+  });
   const completedWithDueDate = completed.filter((t) => !!t.due_date);
   const onTimeRate =
     completedWithDueDate.length > 0

@@ -21,7 +21,10 @@ import { unstable_cache } from "next/cache";
 // ---------------------------------------------------------------------------
 
 const BASE = "https://api.clickup.com/api/v2";
-const TEAM_ID = "90182529148";
+
+const TEAM_ID = process.env.CLICKUP_TEAM_ID;
+if (!TEAM_ID) throw new Error("CLICKUP_TEAM_ID is not set");
+
 const WORKSPACE_ID = `cu_${TEAM_ID}`;
 const REQUEST_TIMEOUT_MS = 10_000;
 const RATE_LIMIT_RETRY_DELAY_MS = 1_000;
@@ -131,9 +134,8 @@ type CURawListsResponse = {
 // ---------------------------------------------------------------------------
 
 function buildHeaders(): Record<string, string> {
-  const token =
-    process.env.CLICKUP_API_TOKEN ??
-    "pk_113635630_CEDP4IBKCDYR30K5XJGBA1R034SD8UV7";
+  const token = process.env.CLICKUP_API_TOKEN;
+  if (!token) throw new Error("CLICKUP_API_TOKEN is not set");
   return {
     Authorization: token,
     "Content-Type": "application/json",

@@ -48,9 +48,14 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   const endMs = parseTimestamp(searchParams.get("end"), now);
 
   // 2. Fetch in parallel
+  // Pass date_updated_gt/lt so getTasks honours the selected period (ISSUE 1)
   const [members, allTasks, timeEntries, spaces] = await Promise.all([
     getMembers(teamId),
-    getTasks(teamId, { include_closed: true }),
+    getTasks(teamId, {
+      include_closed: true,
+      date_updated_gt: startMs,
+      date_updated_lt: endMs,
+    }),
     getTimeEntries(teamId, startMs, endMs),
     getSpaces(teamId),
   ]);
@@ -89,18 +94,37 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         ? Math.round((overdue.length / myTasks.length) * 100)
         : 0;
 
-    // Score: null if no tasks, otherwise weighted formula
+    // On-time rate: use date_done ?? date_closed (not date_updated) to avoid
+    // false "late" results caused by post-closure edits (ISSUE 3 / ISSUE 10)
+    const completedWithDueDate = completed.filter((t) => !!t.due_date);
+    const onTimeCompleted = completedWithDueDate.filter((t) => {
+      const completedAt = Number(t.date_done ?? t.date_closed);
+      return completedAt > 0 && completedAt <= Number(t.due_date);
+    });
+    const onTimeRate =
+      completedWithDueDate.length > 0
+        ? Math.round((onTimeCompleted.length / completedWithDueDate.length) * 100)
+        : 0;
+
+    // Activity rate: tasks that were updated within the selected period
+    const activeCount = myTasks.filter(
+      (t) =>
+        Number(t.date_updated) >= startMs && Number(t.date_updated) <= endMs
+    ).length;
+    const activityRate =
+      myTasks.length > 0
+        ? Math.round((activeCount / myTasks.length) * 100)
+        : 0;
+
+    // Score: null if no tasks; otherwise use same formula as member route (ISSUE 10)
     const score =
       myTasks.length === 0
         ? null
-        : Math.min(
-            100,
-            Math.round(
-              completionRate * 0.4 +
-                (overdueRate === 0 ? 30 : Math.max(0, 30 - overdueRate)) +
-                (inProgress.length > 0 ? 20 : 0) +
-                Math.min(10, myTasks.length) // up to 10 bonus for having tasks
-            )
+        : Math.round(
+            completionRate * 0.3 +
+              onTimeRate * 0.3 +
+              activityRate * 0.2 +
+              (100 - overdueRate) * 0.2
           );
 
     const hoursLogged = (timeByUser.get(member.id) ?? 0) / 3_600_000;

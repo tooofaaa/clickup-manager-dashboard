@@ -659,7 +659,9 @@ export default function TeamEvalPage() {
   )}`;
 
   function navigateToMember(memberId: string) {
-    router.push(`/team/${memberId}?start=${dateRange.start}&end=${dateRange.end}`);
+    router.push(
+      `/team/${memberId}?start=${new Date(dateRange.start).getTime()}&end=${new Date(dateRange.end).getTime()}`
+    );
   }
 
   return (
@@ -747,7 +749,7 @@ export default function TeamEvalPage() {
                 />
                 <KpiCard
                   label="Active Members"
-                  value={`${insights.membersWithTasks} / 28`}
+                  value={`${insights.membersWithTasks} / ${data.members.length}`}
                   sub="of team"
                   icon={Users}
                   iconColor="#f59e0b"
@@ -812,7 +814,7 @@ export default function TeamEvalPage() {
             )}
 
             {/* ── Empty state ─────────────────────────────────────────── */}
-            {!insights && !isLoading && (
+            {(!insights || data?.members.length === 0) && !isLoading && (
               <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-cu-border py-16 text-center">
                 <Users className="h-8 w-8 text-cu-text-tertiary" />
                 <p className="text-[14px] font-medium text-cu-text">

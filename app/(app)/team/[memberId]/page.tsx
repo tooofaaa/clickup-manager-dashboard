@@ -40,17 +40,21 @@ interface MemberInfo {
 }
 
 interface MemberMetrics {
-  totalTasks: number;
-  completedTasks: number;
+  score: number;
   completionRate: number;
-  overdueCount: number;
-  inProgressCount: number;
-  totalTimeMs: number;
-  totalTimeHours: number;
-  avgTimePerTaskMs: number;
-  tasksWithTime: number;
-  onTimeCompletions: number;
+  overdueRate: number;
   onTimeRate: number;
+  activityRate: number;
+  assigned: number;
+  completed: number;
+  overdue: number;
+  inProgress: number;
+  notStarted: number;
+  hoursLogged: number;
+  avgTaskAge: number;
+  spacesWorkedIn: number;
+  priorityBreakdown: Record<string, number>;
+  trend: string;
 }
 
 interface SpaceBreakdownEntry {
@@ -70,6 +74,7 @@ interface MemberProfileData {
   tasks: {
     inProgress: CUTask[];
     completed: CUTask[];
+    notStarted: CUTask[];
     overdue: CUTask[];
     upcoming: CUTask[];
   };
@@ -89,13 +94,6 @@ function startOfMonth(): number {
   d.setDate(1);
   d.setHours(0, 0, 0, 0);
   return d.getTime();
-}
-
-function computeScore(metrics: MemberMetrics): number {
-  const completionPart = metrics.completionRate * 0.45;
-  const onTimePart = metrics.onTimeRate * 0.45;
-  const overduePenalty = Math.min(metrics.overdueCount * 2, 10);
-  return Math.min(100, Math.max(0, Math.round(completionPart + onTimePart + 10 - overduePenalty)));
 }
 
 function scoreColor(score: number): string {
@@ -122,7 +120,6 @@ function isOverdue(task: CUTask): boolean {
   return !!(
     task.due_date &&
     Number(task.due_date) < Date.now() &&
-    task.status.type !== "done" &&
     task.status.type !== "closed"
   );
 }
@@ -297,16 +294,17 @@ function TaskRow({ task }: { task: CUTask }) {
 
 // ── Task panel ───────────────────────────────────────────────────────────────
 
-type TaskTab = "inProgress" | "completed" | "overdue";
+type TaskTab = "inProgress" | "completed" | "notStarted" | "overdue";
 
 function TaskPanels({ tasks }: { tasks: MemberProfileData["tasks"] }) {
   const [activeTab, setActiveTab] = useState<TaskTab>("inProgress");
   const [expanded, setExpanded] = useState(true);
 
   const tabs: { id: TaskTab; label: string; count: number; dot?: string }[] = [
-    { id: "inProgress", label: "In Progress", count: tasks.inProgress.length, dot: "var(--cu-status-active)" },
-    { id: "completed",  label: "Completed",   count: tasks.completed.length,  dot: "var(--cu-status-done)"   },
-    { id: "overdue",    label: "Overdue",     count: tasks.overdue.length,    dot: "var(--cu-urgent)"        },
+    { id: "inProgress",  label: "In Progress",  count: tasks.inProgress.length,  dot: "var(--cu-status-active)" },
+    { id: "completed",   label: "Completed",    count: tasks.completed.length,   dot: "var(--cu-status-done)"   },
+    { id: "notStarted",  label: "Not Started",  count: tasks.notStarted.length,  dot: "var(--cu-text-tertiary)" },
+    { id: "overdue",     label: "Overdue",      count: tasks.overdue.length,     dot: "var(--cu-urgent)"        },
   ];
 
   const list = tasks[activeTab];
@@ -381,7 +379,7 @@ function TaskPanels({ tasks }: { tasks: MemberProfileData["tasks"] }) {
                 <div className="flex items-center gap-1.5">
                   <CalendarDays className="h-3.5 w-3.5 text-cu-text-tertiary" />
                   <span className="text-[11px] font-semibold uppercase tracking-wide text-cu-text-tertiary">
-                    Upcoming — next 14 days
+                    Upcoming — next 30 days
                   </span>
                   <span className="rounded-full bg-cu-hover px-1.5 py-0.5 text-[10px] font-semibold text-cu-text-tertiary">
                     {tasks.upcoming.length}
@@ -558,21 +556,24 @@ const PRIORITY_COLORS: Record<string, string> = {
 const PRIORITY_ORDER = ["urgent", "high", "normal", "low"] as const;
 
 function PriorityBreakdown({ tasks }: { tasks: MemberProfileData["tasks"] }) {
-  const allTasks = [
-    ...tasks.inProgress,
-    ...tasks.completed,
-    ...tasks.overdue,
-  ];
-
   const counts = useMemo(() => {
     const acc: Record<string, number> = { urgent: 0, high: 0, normal: 0, low: 0 };
-    for (const t of allTasks) {
+    for (const t of [
+      ...tasks.inProgress,
+      ...tasks.completed,
+      ...tasks.notStarted,
+      ...tasks.overdue,
+    ]) {
       acc[priorityLabel(t.priority)]++;
     }
     return acc;
-  }, [allTasks.length]);
+  }, [tasks.inProgress, tasks.completed, tasks.notStarted, tasks.overdue]);
 
-  const total = allTasks.length || 1;
+  const total =
+    tasks.inProgress.length +
+    tasks.completed.length +
+    tasks.notStarted.length +
+    tasks.overdue.length || 1;
 
   return (
     <div>
@@ -808,7 +809,7 @@ export default function MemberProfilePage() {
   }
 
   const { member, metrics, tasks } = data;
-  const score = computeScore(metrics);
+  const score = metrics.score;
   const displayName = member.username ?? member.email.split("@")[0];
 
   return (
@@ -881,18 +882,18 @@ export default function MemberProfilePage() {
             />
             <MetricTile
               label="Tasks Done"
-              value={metrics.completedTasks}
+              value={metrics.completed}
               icon={CheckCircle2}
             />
             <MetricTile
               label="Overdue"
-              value={metrics.overdueCount}
+              value={metrics.overdue}
               icon={AlertTriangle}
-              color={metrics.overdueCount > 0 ? "var(--cu-urgent)" : undefined}
+              color={metrics.overdue > 0 ? "var(--cu-urgent)" : undefined}
             />
             <MetricTile
               label="Hours Logged"
-              value={metrics.totalTimeHours}
+              value={metrics.hoursLogged}
               icon={Clock}
             />
           </div>

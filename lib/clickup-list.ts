@@ -179,9 +179,8 @@ type CURawTask = {
 // ---------------------------------------------------------------------------
 
 function buildHeaders(): Record<string, string> {
-  const token =
-    process.env.CLICKUP_API_TOKEN ??
-    "pk_113635630_CEDP4IBKCDYR30K5XJGBA1R034SD8UV7";
+  const token = process.env.CLICKUP_API_TOKEN;
+  if (!token) throw new Error("CLICKUP_API_TOKEN is not set");
   return {
     Authorization: token,
     "Content-Type": "application/json",
@@ -265,25 +264,25 @@ function mapStatuses(
   if (!raw || raw.length === 0) {
     return [
       {
-        id: `${listId}-open`,
+        id: "1",
         status: "Open",
-        color: "#d3d3d3",
+        color: "#87909e",
         type: "NOT_STARTED",
         orderindex: 0,
         position: 0,
       },
       {
-        id: `${listId}-in-progress`,
+        id: "2",
         status: "In Progress",
-        color: "#4169e1",
+        color: "#5b9fff",
         type: "ACTIVE",
         orderindex: 1,
         position: 1,
       },
       {
-        id: `${listId}-done`,
-        status: "Done",
-        color: "#008000",
+        id: "3",
+        status: "Closed",
+        color: "#6bc950",
         type: "DONE",
         orderindex: 2,
         position: 2,
