@@ -420,9 +420,10 @@ function KpiCard({
           <>
             <p
               className={cn(
-                "text-xl font-bold",
+                "truncate text-xl font-bold",
                 warn ? "text-red-600" : "text-cu-text"
               )}
+              title={String(value)}
             >
               {value}
             </p>
@@ -479,7 +480,7 @@ function SpaceHealthTable({ spaces }: { spaces: SpaceHealth[] }) {
                         className="h-2 w-2 shrink-0 rounded-full"
                         style={{ backgroundColor: s.color ?? "#7b68ee" }}
                       />
-                      <span className="font-medium text-cu-text">{s.spaceName}</span>
+                      <span className="font-medium text-cu-text" dir="auto">{s.spaceName}</span>
                     </div>
                   </td>
                   <td className="px-4 py-2.5 text-right font-medium text-cu-text">
@@ -660,14 +661,25 @@ export default function TeamEvalPage() {
 
   const insights = data?.insights;
 
+  // Detect whether the user is still on the default "This Month" range.
+  // The period warning banner should only show when the user has deliberately
+  // changed the date range away from the default.
+  const defaultStart = toInputValue(startOfMonth(today));
+  const defaultEnd = toInputValue(today);
+  const isDefaultRange =
+    dateRange.start === defaultStart && dateRange.end === defaultEnd;
+
   const periodLabel = `${format(fromInputValue(dateRange.start), "MMM d")} – ${format(
     fromInputValue(dateRange.end),
     "MMM d, yyyy"
   )}`;
 
   function navigateToMember(memberId: string) {
+    // Use msFromInput (parseISO) to stay consistent with how startMs/endMs are
+    // computed for the API call — new Date("yyyy-MM-dd") parses as UTC midnight
+    // which can differ by hours in non-UTC timezones.
     router.push(
-      `/team/${memberId}?start=${new Date(dateRange.start).getTime()}&end=${new Date(dateRange.end).getTime()}`
+      `/team/${memberId}?start=${msFromInput(dateRange.start)}&end=${msFromInput(dateRange.end)}`
     );
   }
 
@@ -728,7 +740,7 @@ export default function TeamEvalPage() {
         ) : (
           <>
             {/* ── Period warning banner ────────────────────────────────── */}
-            {insights && !insights.hasPeriodData && (
+            {insights && !insights.hasPeriodData && !isDefaultRange && (
               <div className="flex items-center gap-2 rounded-lg border border-cu-border bg-cu-hover px-4 py-2.5 text-[13px] text-cu-text-secondary">
                 <AlertTriangle className="h-4 w-4 shrink-0 text-[#f59e0b]" />
                 No task activity found in this date range — showing all-time data ({insights.totalTasksAllTime} tasks).
@@ -738,7 +750,7 @@ export default function TeamEvalPage() {
 
             {/* ── 8-card KPI row ───────────────────────────────────────── */}
             {insights && (
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-8">
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <KpiCard
                   label="Total Tasks"
                   value={insights.totalTasks}
@@ -761,7 +773,7 @@ export default function TeamEvalPage() {
                 />
                 <KpiCard
                   label="Active Members"
-                  value={`${insights.membersWithTasks} / ${data.members.length}`}
+                  value={`${insights.membersWithTasks} / ${data?.members.length ?? 0}`}
                   sub="of team"
                   icon={Users}
                   iconColor="#f59e0b"

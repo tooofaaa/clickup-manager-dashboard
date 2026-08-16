@@ -162,7 +162,8 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   });
 
   // 4. Compute team insights (period-filtered)
-  const periodTasks  = tasksInPeriod.length > 0 ? tasksInPeriod : allTasks; // fallback to all if no period match
+  // Always use strictly period-filtered tasks for insights; hasPeriodData tells callers when empty
+  const periodTasks  = tasksInPeriod;
   const hasPeriodData = tasksInPeriod.length > 0;
 
   const unassigned = periodTasks.filter((t) => t.assignees.length === 0);

@@ -2,7 +2,6 @@
 
 import {
   useState,
-  useMemo,
   useEffect,
   type CSSProperties,
 } from "react";
@@ -26,6 +25,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CUTask } from "@/lib/clickup-client";
+import { ActivityHeatmap } from "@/components/eval/activity-heatmap";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,7 +41,7 @@ interface MemberInfo {
 }
 
 interface MemberMetrics {
-  score: number;
+  score: number | null;
   completionRate: number;
   onTimeRate: number;
   totalAssigned: number;
@@ -101,15 +101,15 @@ type Mode = "activity" | "workload";
 // Helpers
 // ---------------------------------------------------------------------------
 
-function scoreColor(score: number): string {
-  if (score === 0) return "#9ca3af";
+function scoreColor(score: number | null): string {
+  if (score === null || score === 0) return "#9ca3af";
   if (score < 40) return "#ef4444";
   if (score < 70) return "#f59e0b";
   return "#22c55e";
 }
 
-function scoreBg(score: number): string {
-  if (score === 0) return "rgba(156,163,175,0.15)";
+function scoreBg(score: number | null): string {
+  if (score === null || score === 0) return "rgba(156,163,175,0.15)";
   if (score < 40) return "rgba(239,68,68,0.12)";
   if (score < 70) return "rgba(245,158,11,0.12)";
   return "rgba(34,197,94,0.12)";
@@ -199,12 +199,16 @@ function Avatar({ member, size = 64 }: { member: MemberInfo; size?: number }) {
 // Score ring
 // ---------------------------------------------------------------------------
 
-function ScoreRing({ score }: { score: number }) {
-  const color = scoreColor(score);
-  const bg = scoreBg(score);
+function ScoreRing({ score }: { score: number | null }) {
+  const isNull = score === null;
+  const effectiveScore = score ?? 0;
+  const color = isNull ? "#9ca3af" : scoreColor(effectiveScore);
+  const bg = isNull ? "rgba(156,163,175,0.15)" : scoreBg(effectiveScore);
   const r = 28;
   const circumference = 2 * Math.PI * r;
-  const offset = circumference * (1 - Math.max(0, Math.min(100, score)) / 100);
+  const offset = isNull
+    ? circumference
+    : circumference * (1 - Math.max(0, Math.min(100, effectiveScore)) / 100);
 
   return (
     <div className="flex flex-col items-center gap-1">
@@ -222,7 +226,7 @@ function ScoreRing({ score }: { score: number }) {
           />
         </svg>
         <span className="absolute text-[18px] font-bold" style={{ color }}>
-          {score}
+          {isNull ? "—" : score}
         </span>
       </div>
       <span className="text-[10px] font-semibold uppercase tracking-wide text-cu-text-tertiary">
@@ -337,7 +341,7 @@ function EmptyTab({ label }: { label: string }) {
   return (
     <div className="flex flex-col items-center justify-center py-10 gap-1.5">
       <ListTodo className="h-5 w-5 text-cu-text-tertiary opacity-40" />
-      <p className="text-[12px] text-cu-text-tertiary">No tasks in this category for this period</p>
+      <p className="text-[12px] text-cu-text-tertiary">No tasks in this period</p>
       <p className="text-[11px] text-cu-text-tertiary opacity-60">{label}</p>
     </div>
   );
@@ -456,65 +460,6 @@ function WorkloadTabs({
         ) : (
           list.map(task => <TaskRow key={task.id} task={task} />)
         )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Activity heatmap
-// ---------------------------------------------------------------------------
-
-function ActivityHeatmap({ heatmap }: { heatmap: Record<string, number> }) {
-  const days = useMemo(() => {
-    const arr: { date: string; count: number }[] = [];
-    const now = new Date();
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
-      arr.push({ date: key, count: heatmap[key] ?? 0 });
-    }
-    return arr;
-  }, [heatmap]);
-
-  const maxCount = Math.max(1, ...days.map(d => d.count));
-
-  function cellColor(count: number): string {
-    if (count === 0) return "var(--cu-hover)";
-    const i = count / maxCount;
-    if (i < 0.25) return "rgba(34,197,94,0.3)";
-    if (i < 0.5)  return "rgba(34,197,94,0.55)";
-    if (i < 0.75) return "rgba(34,197,94,0.75)";
-    return "#22c55e";
-  }
-
-  return (
-    <div>
-      <div className="mb-2 flex items-center gap-2">
-        <CalendarDays className="h-3.5 w-3.5 text-cu-text-tertiary" />
-        <span className="text-[12px] font-semibold text-cu-text">Activity — last 30 days</span>
-      </div>
-      <div className="flex flex-wrap gap-1">
-        {days.map(({ date, count }) => (
-          <div
-            key={date}
-            title={`${date}: ${count} update${count !== 1 ? "s" : ""}`}
-            className="h-4 w-4 rounded-sm"
-            style={{ background: cellColor(count) }}
-          />
-        ))}
-      </div>
-      <div className="mt-2 flex items-center gap-1.5 text-[10px] text-cu-text-tertiary">
-        <span>Less</span>
-        {[0, 0.3, 0.55, 0.75, 1].map((level, idx) => (
-          <div
-            key={idx}
-            className="h-3 w-3 rounded-sm"
-            style={{ background: level === 0 ? "var(--cu-hover)" : `rgba(34,197,94,${level})` }}
-          />
-        ))}
-        <span>More</span>
       </div>
     </div>
   );
@@ -780,7 +725,15 @@ function ProfileSkeleton() {
 // Error state
 // ---------------------------------------------------------------------------
 
-function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
+function ErrorState({
+  message,
+  onRetry,
+  onBack,
+}: {
+  message: string;
+  onRetry: () => void;
+  onBack?: () => void;
+}) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
       <AlertTriangle className="h-8 w-8 text-cu-urgent" />
@@ -788,12 +741,23 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
         <p className="text-[14px] font-semibold text-cu-text">Failed to load member profile</p>
         <p className="mt-1 text-[12px] text-cu-text-tertiary">{message}</p>
       </div>
-      <button
-        onClick={onRetry}
-        className="rounded-lg border border-cu-border px-4 py-1.5 text-[12px] text-cu-text-secondary hover:bg-cu-hover"
-      >
-        Retry
-      </button>
+      <div className="flex items-center gap-2">
+        {onBack && (
+          <button
+            onClick={onBack}
+            className="flex items-center gap-1.5 rounded-lg border border-cu-border px-4 py-1.5 text-[12px] text-cu-text-secondary hover:bg-cu-hover"
+          >
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Back to team
+          </button>
+        )}
+        <button
+          onClick={onRetry}
+          className="rounded-lg border border-cu-border px-4 py-1.5 text-[12px] text-cu-text-secondary hover:bg-cu-hover"
+        >
+          Retry
+        </button>
+      </div>
     </div>
   );
 }
@@ -866,6 +830,11 @@ export default function MemberProfilePage() {
     setDateRange({ start, end });
   }
 
+  // Back link preserves date range — defined before early returns so ErrorState can use it
+  function goBack() {
+    router.push(`/team?start=${dateRange.start}&end=${dateRange.end}`);
+  }
+
   // ── Render ─────────────────────────────────────────────────────────────────
 
   if (isLoading) return <ProfileSkeleton />;
@@ -874,17 +843,13 @@ export default function MemberProfilePage() {
       <ErrorState
         message={String(error ?? "No data returned")}
         onRetry={() => refetch()}
+        onBack={goBack}
       />
     );
   }
 
   const { member, metrics, activity, workload, activityHeatmap, spaceBreakdown, velocityByWeek, priorityBreakdown } = data;
   const displayName = member.username ?? member.email.split("@")[0];
-
-  // Back link preserves date range
-  function goBack() {
-    router.push(`/team?start=${dateRange.start}&end=${dateRange.end}`);
-  }
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -946,7 +911,7 @@ export default function MemberProfilePage() {
           <div className="mt-4 flex flex-wrap gap-3">
             <MetricTile
               label="Score"
-              value={metrics.score}
+              value={metrics.score ?? "—"}
               icon={TrendingUp}
               color={scoreColor(metrics.score)}
               highlight
@@ -1049,7 +1014,13 @@ export default function MemberProfilePage() {
 
             {analyticsOpen && (
               <div className="border-t border-cu-border px-4 py-4 grid grid-cols-1 gap-6 sm:grid-cols-2">
-                <ActivityHeatmap heatmap={activityHeatmap} />
+                <div>
+                  <div className="mb-2 flex items-center gap-2">
+                    <CalendarDays className="h-3.5 w-3.5 text-cu-text-tertiary" />
+                    <span className="text-[12px] font-semibold text-cu-text">Activity — last 30 days</span>
+                  </div>
+                  <ActivityHeatmap data={activityHeatmap} />
+                </div>
                 <SpaceBreakdown breakdown={spaceBreakdown} />
                 <WeeklyVelocity velocity={velocityByWeek} />
                 <PriorityBreakdown breakdown={priorityBreakdown} />

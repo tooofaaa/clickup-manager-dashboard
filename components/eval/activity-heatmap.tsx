@@ -49,7 +49,7 @@ export function ActivityHeatmap({ data, isLoading }: ActivityHeatmapProps) {
   const labelDays = new Set(DAY_LABELS);
 
   return (
-    <div className="space-y-2" style={{ position: "relative" }}>
+    <div className="space-y-2" style={{ position: "relative" }} data-heatmap="">
       <div
         style={{
           display: "grid",

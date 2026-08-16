@@ -97,6 +97,20 @@ export async function GET(
     ),
   ]);
 
+  // ── Fallback: assignees[] filter may silently return no tasks ────────────
+  // If the API ignored the assignees[] param, fetch all tasks and filter manually.
+  const resolvedTasks: CUTask[] =
+    allTasks.length > 0
+      ? allTasks
+      : await settle(
+          getTasks(teamId, { include_closed: true }).then((all) =>
+            all.filter((t) =>
+              t.assignees.some((a) => a.id === Number(memberId))
+            )
+          ),
+          [] as CUTask[]
+        );
+
   // ── Resolve member details ────────────────────────────────────────────────
   // assignee.id is a NUMBER; memberId is a STRING — compare with Number()
   const memberUser = members.find((m) => String(m.id) === memberId);
@@ -126,7 +140,7 @@ export async function GET(
   // ── ACTIVITY — what the person DID during the period ─────────────────────
 
   /** Tasks completed (date_closed OR date_done) within [startMs, endMs] */
-  const completedInPeriod = allTasks.filter((t) => {
+  const completedInPeriod = resolvedTasks.filter((t) => {
     if (!hasAssignee(t)) return false;
     const closedAt = t.date_closed || t.date_done;
     if (!closedAt) return false;
@@ -135,14 +149,14 @@ export async function GET(
   });
 
   /** Tasks created (date_created) within [startMs, endMs] */
-  const assignedInPeriod = allTasks.filter((t) => {
+  const assignedInPeriod = resolvedTasks.filter((t) => {
     if (!hasAssignee(t)) return false;
     const createdTs = Number(t.date_created);
     return createdTs >= startMs && createdTs <= endMs;
   });
 
   /** Tasks with due_date within [startMs, endMs] */
-  const dueInPeriod = allTasks.filter((t) => {
+  const dueInPeriod = resolvedTasks.filter((t) => {
     if (!hasAssignee(t)) return false;
     if (!t.due_date) return false;
     const dueTs = Number(t.due_date);
@@ -165,7 +179,7 @@ export async function GET(
    *   AND (status.type !== 'closed' OR Number(date_closed||date_done) >= startMs)
    *   AND assignees includes this member
    */
-  const allAssigned = allTasks.filter((t) => {
+  const allAssigned = resolvedTasks.filter((t) => {
     if (!hasAssignee(t)) return false;
     if (Number(t.date_created) > endMs) return false;
     if (t.status.type === "closed") {
@@ -226,7 +240,7 @@ export async function GET(
 
   /** Activity heatmap: group ALL member tasks by date_updated date */
   const activityHeatmap: Record<string, number> = {};
-  for (const t of allTasks) {
+  for (const t of resolvedTasks) {
     if (!hasAssignee(t)) continue;
     const dateKey = new Date(Number(t.date_updated))
       .toISOString()
