@@ -1,21 +1,23 @@
 "use client";
 
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { format, subDays, parseISO } from "date-fns";
+import {
+  format,
+  startOfMonth,
+  endOfMonth,
+  subMonths,
+} from "date-fns";
 import {
   ArrowLeft,
-  Folder,
-  List,
-  User,
-  Users,
+  ExternalLink,
+  RefreshCw,
   ChevronDown,
   ChevronRight,
-  ExternalLink,
+  Search,
   Calendar,
-  Clock,
-  RefreshCw,
+  BarChart2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CUTask } from "@/lib/clickup-client";
@@ -91,55 +93,119 @@ interface SpaceDetailResponse {
 }
 
 // ---------------------------------------------------------------------------
-// View mode / filter types
+// View / tab types
 // ---------------------------------------------------------------------------
 
-type ViewMode = "project" | "person" | "timeline";
-type FilterMode = "current" | "as-of-date" | "period";
-type StatusFilter = "all" | "open" | "custom" | "closed" | "overdue";
+type MainView = "period" | "cumulative";
+type PeriodTab = "opened" | "completed" | "overdue" | "inprogress";
+type CumulativeTab = "stillopen" | "overdue" | "completed" | "all";
+type PeriodPreset = "thismonth" | "lastmonth" | "last3months" | "custom";
+type CumulativePreset = "today" | "endlastmonth" | "6monthsago" | "custom";
 
 // ---------------------------------------------------------------------------
-// Priority config
+// Filter logic
 // ---------------------------------------------------------------------------
 
-const PRIORITY_CONFIG: Record<string, { color: string; label: string }> = {
-  urgent: { color: "var(--cu-urgent)", label: "Urgent" },
-  high: { color: "var(--cu-high)", label: "High" },
-  normal: { color: "var(--cu-normal)", label: "Normal" },
-  low: { color: "var(--cu-low)", label: "Low" },
-};
-
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
-
-function isOverdue(task: CUTask): boolean {
-  if (!task.due_date) return false;
-  const dueMs = Number(task.due_date);
-  const isOpen = task.status.type !== "closed" && task.status.type !== "done";
-  return isOpen && dueMs < Date.now();
+function filterTaskForPeriod(
+  task: CUTask,
+  startMs: number,
+  endMs: number,
+  tab: PeriodTab
+): boolean {
+  switch (tab) {
+    case "opened":
+      return (
+        Number(task.date_created) >= startMs &&
+        Number(task.date_created) <= endMs
+      );
+    case "completed":
+      return !!(
+        task.date_closed &&
+        Number(task.date_closed) >= startMs &&
+        Number(task.date_closed) <= endMs
+      );
+    case "overdue":
+      return !!(
+        task.due_date &&
+        Number(task.due_date) >= startMs &&
+        Number(task.due_date) <= endMs &&
+        task.status.type !== "closed"
+      );
+    case "inprogress":
+      return (
+        Number(task.date_updated) >= startMs &&
+        Number(task.date_updated) <= endMs &&
+        task.status.type !== "closed"
+      );
+  }
 }
 
-function formatDue(dueDateMs: string): string {
-  return format(new Date(Number(dueDateMs)), "MMM d");
+function filterTaskForCumulative(
+  task: CUTask,
+  cutoffMs: number,
+  tab: CumulativeTab
+): boolean {
+  switch (tab) {
+    case "stillopen":
+      return (
+        Number(task.date_created) <= cutoffMs &&
+        (task.status.type !== "closed" ||
+          (!!task.date_closed && Number(task.date_closed) > cutoffMs))
+      );
+    case "overdue":
+      return !!(
+        task.due_date &&
+        Number(task.due_date) < cutoffMs &&
+        (task.status.type !== "closed" ||
+          (!!task.date_closed && Number(task.date_closed) > cutoffMs))
+      );
+    case "completed":
+      return !!(task.date_closed && Number(task.date_closed) <= cutoffMs);
+    case "all":
+      return Number(task.date_created) <= cutoffMs;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Date helpers
+// ---------------------------------------------------------------------------
+
+function todayStr(): string {
+  return format(new Date(), "yyyy-MM-dd");
+}
+
+function msForDate(dateStr: string): number {
+  // parse date string as start of local day
+  return new Date(dateStr + "T00:00:00").getTime();
+}
+
+function msForDateEndOfDay(dateStr: string): number {
+  return new Date(dateStr + "T23:59:59").getTime();
+}
+
+function daysLate(dueDateMs: number, referenceMs: number): number {
+  return Math.floor((referenceMs - dueDateMs) / 86_400_000);
 }
 
 // ---------------------------------------------------------------------------
 // AssigneeAvatar
 // ---------------------------------------------------------------------------
-function AssigneeAvatar({
-  user,
-  size = 20,
-}: {
-  user: { username?: string | null; email: string; color?: string | null; profilePicture?: string | null; initials: string };
-  size?: number;
-}) {
+
+interface AvatarUser {
+  username?: string | null;
+  email: string;
+  color?: string | null;
+  profilePicture?: string | null;
+  initials: string;
+}
+
+function AssigneeAvatar({ user, size = 20 }: { user: AvatarUser; size?: number }) {
   const bg = user.color ?? "var(--cu-purple)";
   const style = {
     width: size,
     height: size,
     minWidth: size,
-    fontSize: size * 0.38,
+    fontSize: Math.floor(size * 0.38),
     backgroundColor: bg,
   };
 
@@ -166,1009 +232,312 @@ function AssigneeAvatar({
 }
 
 // ---------------------------------------------------------------------------
-// TaskRow
+// StatusBadge
 // ---------------------------------------------------------------------------
-function TaskRow({ task }: { task: CUTask }) {
-  const overdue = isOverdue(task);
-  const priority = task.priority?.priority?.toLowerCase();
-  const priorityConfig = priority ? PRIORITY_CONFIG[priority] : null;
 
-  // Show max 3 assignees, then +N overflow
-  const visibleAssignees = task.assignees.slice(0, 3);
-  const overflow = task.assignees.length - 3;
-
+function StatusBadge({ task }: { task: CUTask }) {
   return (
-    <a
-      href={task.url}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="group flex min-w-0 items-center gap-2 rounded-lg px-3 py-1.5 transition-colors hover:bg-cu-hover"
+    <span
+      className="inline-flex max-w-[90px] truncate items-center rounded-full px-2 py-0.5 text-[10px] font-semibold leading-none"
+      style={{
+        color: task.status.color || "var(--cu-text-secondary)",
+        backgroundColor: `${task.status.color}22`,
+        border: `1px solid ${task.status.color}44`,
+      }}
+      title={task.status.status}
     >
-      {/* Status dot */}
-      <span
-        className="h-2.5 w-2.5 shrink-0 rounded-full"
-        style={{ backgroundColor: task.status.color || "var(--cu-text-tertiary)" }}
-        title={task.status.status}
-      />
-
-      {/* Task name */}
-      <span className="min-w-0 flex-1 truncate text-[12px] text-cu-text">
-        {task.name}
-      </span>
-
-      {/* Assignee avatars */}
-      {task.assignees.length > 0 && (
-        <div className="hidden shrink-0 items-center -space-x-1 sm:flex">
-          {visibleAssignees.map((a) => (
-            <AssigneeAvatar
-              key={a.id}
-              user={{
-                username: a.username,
-                email: a.email,
-                color: a.color,
-                profilePicture: a.profilePicture,
-                initials: a.initials,
-              }}
-              size={18}
-            />
-          ))}
-          {overflow > 0 && (
-            <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-cu-hover text-[9px] font-semibold text-cu-text-secondary">
-              +{overflow}
-            </span>
-          )}
-        </div>
-      )}
-
-      {/* Due date */}
-      {task.due_date && (
-        <span
-          className={cn(
-            "shrink-0 text-[11px] font-medium",
-            overdue ? "text-red-500" : "text-cu-text-tertiary"
-          )}
-        >
-          {formatDue(task.due_date)}
-        </span>
-      )}
-
-      {/* Priority badge */}
-      {priorityConfig && (
-        <span
-          className="h-2 w-2 shrink-0 rounded-full"
-          style={{ backgroundColor: priorityConfig.color }}
-          title={priorityConfig.label}
-        />
-      )}
-
-      {/* "Open in ClickUp" hover link */}
-      <ExternalLink className="h-3 w-3 shrink-0 text-cu-text-tertiary opacity-0 transition-opacity group-hover:opacity-100" />
-    </a>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Count badge
-// ---------------------------------------------------------------------------
-function CountBadge({ count }: { count: number }) {
-  return (
-    <span className="ml-1.5 rounded-full bg-cu-hover px-1.5 py-0.5 text-[10px] font-medium text-cu-text-secondary">
-      {count}
+      {task.status.status}
     </span>
   );
 }
 
 // ---------------------------------------------------------------------------
-// BY PROJECT view
+// TaskRow (period & cumulative)
 // ---------------------------------------------------------------------------
 
-interface ByProjectViewProps {
-  folders: FolderItem[];
-  folderlessLists: FolderListItem[];
-  byList: ByListEntry[];
+interface TaskRowProps {
+  task: CUTask;
+  highlightOverdue?: boolean;
+  highlightCompleted?: boolean;
+  showCompletedDate?: boolean;
+  referenceMs?: number; // for "days late" calculation
 }
 
-function ByProjectView({ folders, folderlessLists, byList }: ByProjectViewProps) {
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set());
-  const [collapsedLists, setCollapsedLists] = useState<Set<string>>(new Set());
+function TaskRow({
+  task,
+  highlightOverdue,
+  highlightCompleted,
+  showCompletedDate,
+  referenceMs,
+}: TaskRowProps) {
+  const [expanded, setExpanded] = useState(false);
+  const visibleAssignees = task.assignees.slice(0, 3);
+  const overflowAssignees = task.assignees.length - 3;
 
-  // Build a map: listId → ByListEntry for quick lookup
-  const listTaskMap = useMemo(() => {
-    const m = new Map<string, CUTask[]>();
-    for (const entry of byList) {
-      m.set(entry.listId, entry.tasks);
-    }
-    return m;
-  }, [byList]);
+  const refMs = referenceMs ?? Date.now();
+  const dueMs = task.due_date ? Number(task.due_date) : null;
+  const late = dueMs !== null && highlightOverdue ? daysLate(dueMs, refMs) : null;
+  const closedMs = task.date_closed ? Number(task.date_closed) : null;
 
-  function toggleFolder(folderId: string) {
-    setCollapsedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(folderId)) next.delete(folderId);
-      else next.add(folderId);
-      return next;
-    });
-  }
-
-  function toggleList(listId: string) {
-    setCollapsedLists((prev) => {
-      const next = new Set(prev);
-      if (next.has(listId)) next.delete(listId);
-      else next.add(listId);
-      return next;
-    });
-  }
-
-  // Ungrouped: folderless lists
-  const ungroupedLists = folderlessLists.filter((l) => listTaskMap.has(l.id) || l.taskCount > 0);
-
-  // If no data at all for a folder, still show it from the folders array
-  // (some lists may have 0 tasks but still need to show)
-  const allFolders = folders;
-
-  return (
-    <div className="space-y-4">
-      {/* Folders */}
-      {allFolders.map((folder) => {
-        const folderTasks = folder.lists.flatMap((l) => listTaskMap.get(l.id) ?? []);
-        const folderCollapsed = collapsedFolders.has(folder.id);
-
-        return (
-          <div
-            key={folder.id}
-            className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden"
-          >
-            {/* Folder header */}
-            <button
-              onClick={() => toggleFolder(folder.id)}
-              className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-cu-hover"
-            >
-              <Folder className="h-4 w-4 shrink-0 text-cu-purple" />
-              <span className="flex-1 text-[13px] font-semibold text-cu-text">
-                {folder.name}
-              </span>
-              <CountBadge count={folderTasks.length} />
-              {folderCollapsed ? (
-                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-              )}
-            </button>
-
-            {/* Lists */}
-            {!folderCollapsed && (
-              <div className="border-t border-cu-border divide-y divide-cu-border">
-                {folder.lists.map((list) => {
-                  const tasks = listTaskMap.get(list.id) ?? [];
-                  const listCollapsed = collapsedLists.has(list.id);
-
-                  return (
-                    <div key={list.id}>
-                      <button
-                        onClick={() => toggleList(list.id)}
-                        className="flex w-full items-center gap-2 bg-cu-hover/40 px-4 py-2 text-left transition-colors hover:bg-cu-hover"
-                      >
-                        <List className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-                        <span className="flex-1 text-[12px] font-medium text-cu-text-secondary">
-                          {list.name}
-                        </span>
-                        <CountBadge count={tasks.length} />
-                        {listCollapsed ? (
-                          <ChevronRight className="h-3 w-3 shrink-0 text-cu-text-tertiary" />
-                        ) : (
-                          <ChevronDown className="h-3 w-3 shrink-0 text-cu-text-tertiary" />
-                        )}
-                      </button>
-
-                      {!listCollapsed && tasks.length > 0 && (
-                        <div className="max-h-80 overflow-y-auto px-2 py-1">
-                          {tasks.map((task) => (
-                            <TaskRow key={task.id} task={task} />
-                          ))}
-                        </div>
-                      )}
-
-                      {!listCollapsed && tasks.length === 0 && (
-                        <p className="px-4 py-3 text-[12px] text-cu-text-tertiary">
-                          No tasks in this list.
-                        </p>
-                      )}
-                    </div>
-                  );
-                })}
-                {folder.lists.length === 0 && (
-                  <p className="px-4 py-3 text-[12px] text-cu-text-tertiary">
-                    No lists in this folder.
-                  </p>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      })}
-
-      {/* Ungrouped / folderless lists */}
-      {(ungroupedLists.length > 0 || folderlessLists.length > 0) && (
-        <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
-          {/* Ungrouped header */}
-          <div className="flex items-center gap-2 border-b border-cu-border px-4 py-3">
-            <List className="h-4 w-4 shrink-0 text-cu-text-tertiary" />
-            <span className="flex-1 text-[13px] font-semibold text-cu-text">
-              Ungrouped
-            </span>
-            <CountBadge
-              count={folderlessLists.reduce(
-                (sum, l) => sum + (listTaskMap.get(l.id)?.length ?? 0),
-                0
-              )}
-            />
-          </div>
-
-          <div className="divide-y divide-cu-border">
-            {folderlessLists.map((list) => {
-              const tasks = listTaskMap.get(list.id) ?? [];
-              const listCollapsed = collapsedLists.has(`fl-${list.id}`);
-
-              return (
-                <div key={list.id}>
-                  <button
-                    onClick={() =>
-                      setCollapsedLists((prev) => {
-                        const next = new Set(prev);
-                        const key = `fl-${list.id}`;
-                        if (next.has(key)) next.delete(key);
-                        else next.add(key);
-                        return next;
-                      })
-                    }
-                    className="flex w-full items-center gap-2 bg-cu-hover/40 px-4 py-2 text-left transition-colors hover:bg-cu-hover"
-                  >
-                    <List className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-                    <span className="flex-1 text-[12px] font-medium text-cu-text-secondary">
-                      {list.name}
-                    </span>
-                    <CountBadge count={tasks.length} />
-                    {listCollapsed ? (
-                      <ChevronRight className="h-3 w-3 shrink-0 text-cu-text-tertiary" />
-                    ) : (
-                      <ChevronDown className="h-3 w-3 shrink-0 text-cu-text-tertiary" />
-                    )}
-                  </button>
-
-                  {!listCollapsed && tasks.length > 0 && (
-                    <div className="max-h-80 overflow-y-auto px-2 py-1">
-                      {tasks.map((task) => (
-                        <TaskRow key={task.id} task={task} />
-                      ))}
-                    </div>
-                  )}
-
-                  {!listCollapsed && tasks.length === 0 && (
-                    <p className="px-4 py-3 text-[12px] text-cu-text-tertiary">
-                      No tasks in this list.
-                    </p>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
-      {/* No folders or lists */}
-      {allFolders.length === 0 && folderlessLists.length === 0 && (
-        <EmptyState message="No lists or folders found in this space." />
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// BY PERSON view
-// ---------------------------------------------------------------------------
-
-interface PersonSectionProps {
-  entry: ByAssigneeEntry;
-}
-
-function PersonSection({ entry }: PersonSectionProps) {
-  const [expanded, setExpanded] = useState(entry.tasks.length <= 10);
-
-  const openCount = entry.tasks.filter((t) => t.status.type === "open").length;
-  const inProgressCount = entry.tasks.filter((t) => t.status.type === "custom").length;
-  const overdueCount = entry.tasks.filter(isOverdue).length;
-
-  return (
-    <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
-      {/* Person header */}
-      <button
-        onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-cu-hover"
-      >
-        {/* Avatar */}
-        <div
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-semibold text-white text-[11px] uppercase"
-          style={{
-            backgroundColor: entry.assigneeColor ?? "var(--cu-purple)",
-            backgroundImage: entry.assigneeAvatar
-              ? `url(${entry.assigneeAvatar})`
-              : undefined,
-            backgroundSize: "cover",
-            backgroundPosition: "center",
-          }}
-        >
-          {!entry.assigneeAvatar ? entry.assigneeInitials || "?" : null}
-        </div>
-
-        {/* Name + email */}
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-[13px] font-semibold text-cu-text">
-            {entry.assigneeName}
-          </p>
-          <p className="truncate text-[11px] text-cu-text-tertiary">
-            {entry.assigneeEmail}
-          </p>
-        </div>
-
-        {/* Task count badge */}
-        <span className="shrink-0 rounded-full bg-cu-purple-light px-2 py-0.5 text-[11px] font-semibold text-cu-purple">
-          {entry.tasks.length}
-        </span>
-
-        {/* Expand/collapse arrow */}
-        {expanded ? (
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-        )}
-      </button>
-
-      {/* Stats chips */}
-      <div className="flex flex-wrap gap-1.5 border-t border-cu-border px-4 py-2">
-        <span className="rounded-full border border-cu-border bg-cu-hover px-2 py-0.5 text-[11px] font-medium text-cu-text-secondary">
-          <span className="font-bold text-cu-text">{openCount}</span> open
-        </span>
-        <span className="rounded-full border border-cu-border bg-cu-hover px-2 py-0.5 text-[11px] font-medium text-cu-text-secondary">
-          <span className="font-bold text-cu-text">{inProgressCount}</span> in progress
-        </span>
-        {overdueCount > 0 && (
-          <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[11px] font-medium text-red-700">
-            <span className="font-bold">{overdueCount}</span> overdue
-          </span>
-        )}
-      </div>
-
-      {/* Task list */}
-      {expanded && (
-        <div className="max-h-96 overflow-y-auto border-t border-cu-border px-2 py-1">
-          {entry.tasks.map((task) => (
-            <TaskRow key={task.id} task={task} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-interface ByPersonViewProps {
-  byAssignee: ByAssigneeEntry[];
-  unassignedTasks: CUTask[];
-}
-
-function ByPersonView({ byAssignee, unassignedTasks }: ByPersonViewProps) {
-  const [unassignedExpanded, setUnassignedExpanded] = useState(false);
-
-  return (
-    <div className="space-y-3">
-      {byAssignee.map((entry) => (
-        <PersonSection key={entry.assigneeId} entry={entry} />
-      ))}
-
-      {/* Unassigned tasks */}
-      {unassignedTasks.length > 0 && (
-        <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
-          <button
-            onClick={() => setUnassignedExpanded((v) => !v)}
-            className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-cu-hover"
-          >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-cu-hover">
-              <User className="h-4 w-4 text-cu-text-tertiary" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="truncate text-[13px] font-semibold text-cu-text">
-                Unassigned Tasks
-              </p>
-              <p className="truncate text-[11px] text-cu-text-tertiary">
-                No assignees
-              </p>
-            </div>
-            <span className="shrink-0 rounded-full border border-cu-border bg-cu-hover px-2 py-0.5 text-[11px] font-semibold text-cu-text-secondary">
-              {unassignedTasks.length}
-            </span>
-            {unassignedExpanded ? (
-              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-            )}
-          </button>
-
-          {unassignedExpanded && (
-            <div className="max-h-96 overflow-y-auto border-t border-cu-border px-2 py-1">
-              {unassignedTasks.map((task) => (
-                <TaskRow key={task.id} task={task} />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {byAssignee.length === 0 && unassignedTasks.length === 0 && (
-        <EmptyState message="No tasks assigned in this space." />
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// TIMELINE view
-// ---------------------------------------------------------------------------
-
-interface TimelineViewProps {
-  tasks: CUTask[];
-}
-
-function TimelineView({ tasks }: TimelineViewProps) {
-  const now = Date.now();
-
-  // Only tasks with due_date or start_date
-  const datedTasks = useMemo(
-    () =>
-      tasks
-        .filter((t) => t.due_date || t.start_date)
-        .sort((a, b) => {
-          // Overdue first, then by due date ascending
-          const aOverdue = isOverdue(a) ? 0 : 1;
-          const bOverdue = isOverdue(b) ? 0 : 1;
-          if (aOverdue !== bOverdue) return aOverdue - bOverdue;
-          const aDate = Number(a.due_date ?? a.start_date ?? "0");
-          const bDate = Number(b.due_date ?? b.start_date ?? "0");
-          return aDate - bDate;
-        }),
-    [tasks]
-  );
-
-  if (datedTasks.length === 0) {
-    return (
-      <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-cu-border py-16 text-center">
-        <Calendar className="h-8 w-8 text-cu-text-tertiary" />
-        <p className="text-[14px] font-medium text-cu-text">
-          These tasks have no dates set
-        </p>
-        <p className="text-[13px] text-cu-text-tertiary">
-          Add due dates or start dates to tasks in ClickUp to see them here.
-        </p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden">
-      <div className="overflow-x-auto">
-        <table className="w-full text-[12px]">
-          <thead>
-            <tr className="border-b border-cu-border bg-cu-hover">
-              <th className="min-w-[220px] px-4 py-2.5 text-left font-medium text-cu-text-secondary">
-                Task
-              </th>
-              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary">
-                Assignees
-              </th>
-              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary">
-                Status
-              </th>
-              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary">
-                Start
-              </th>
-              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary">
-                Due
-              </th>
-              <th className="px-4 py-2.5 text-left font-medium text-cu-text-secondary">
-                Duration
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {datedTasks.map((task) => {
-              const overdue = isOverdue(task);
-              const startMs = task.start_date ? Number(task.start_date) : null;
-              const dueMs = task.due_date ? Number(task.due_date) : null;
-
-              // Duration in days (if both dates present)
-              let durationLabel = "—";
-              if (startMs && dueMs && dueMs > startMs) {
-                const days = Math.round((dueMs - startMs) / 86_400_000);
-                durationLabel = days === 1 ? "1d" : `${days}d`;
-              } else if (dueMs && dueMs < now && !startMs) {
-                // Only due date, already overdue
-                durationLabel = "—";
-              }
-
-              return (
-                <tr
-                  key={task.id}
-                  className={cn(
-                    "border-b border-cu-border last:border-b-0 transition-colors hover:bg-cu-hover",
-                    overdue && "bg-red-50/30"
-                  )}
-                >
-                  {/* Task name */}
-                  <td className="px-4 py-2.5">
-                    <a
-                      href={task.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="group flex items-center gap-1.5"
-                    >
-                      <span
-                        className="h-2 w-2 shrink-0 rounded-full"
-                        style={{ backgroundColor: task.status.color || "var(--cu-text-tertiary)" }}
-                      />
-                      <span
-                        className={cn(
-                          "line-clamp-1 max-w-[200px] text-[12px] font-medium group-hover:text-cu-purple",
-                          overdue ? "text-red-600" : "text-cu-text"
-                        )}
-                      >
-                        {task.name}
-                      </span>
-                      <ExternalLink className="h-2.5 w-2.5 shrink-0 text-cu-text-tertiary opacity-0 group-hover:opacity-100" />
-                    </a>
-                  </td>
-
-                  {/* Assignees */}
-                  <td className="px-4 py-2.5">
-                    {task.assignees.length === 0 ? (
-                      <span className="text-cu-text-tertiary">—</span>
-                    ) : (
-                      <div className="flex items-center -space-x-1">
-                        {task.assignees.slice(0, 4).map((a) => (
-                          <AssigneeAvatar
-                            key={a.id}
-                            user={{
-                              username: a.username,
-                              email: a.email,
-                              color: a.color,
-                              profilePicture: a.profilePicture,
-                              initials: a.initials,
-                            }}
-                            size={20}
-                          />
-                        ))}
-                        {task.assignees.length > 4 && (
-                          <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-cu-hover text-[9px] font-semibold text-cu-text-secondary">
-                            +{task.assignees.length - 4}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </td>
-
-                  {/* Status */}
-                  <td className="px-4 py-2.5">
-                    <span
-                      className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
-                      style={{
-                        color: task.status.color || "var(--cu-text-secondary)",
-                        backgroundColor: `${task.status.color}18`,
-                      }}
-                    >
-                      {task.status.status}
-                    </span>
-                  </td>
-
-                  {/* Start date */}
-                  <td className="px-4 py-2.5 text-cu-text-secondary">
-                    {startMs ? (
-                      <span className="flex items-center gap-1">
-                        <Clock className="h-3 w-3 text-cu-text-tertiary" />
-                        {format(new Date(startMs), "MMM d")}
-                      </span>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-
-                  {/* Due date */}
-                  <td className="px-4 py-2.5">
-                    {dueMs ? (
-                      <span
-                        className={cn(
-                          "flex items-center gap-1 font-medium",
-                          overdue ? "text-red-500" : "text-cu-text-secondary"
-                        )}
-                      >
-                        <Calendar className="h-3 w-3" />
-                        {format(new Date(dueMs), "MMM d, yyyy")}
-                      </span>
-                    ) : (
-                      <span className="text-cu-text-tertiary">—</span>
-                    )}
-                  </td>
-
-                  {/* Duration */}
-                  <td className="px-4 py-2.5 text-cu-text-secondary">
-                    {durationLabel}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Empty state
-// ---------------------------------------------------------------------------
-function EmptyState({ message }: { message: string }) {
-  return (
-    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-cu-border py-16 text-center">
-      <Users className="h-8 w-8 text-cu-text-tertiary" />
-      <p className="text-[14px] font-medium text-cu-text">
-        No tasks in this space yet.
-      </p>
-      <p className="text-[13px] text-cu-text-tertiary">{message}</p>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Loading skeleton
-// ---------------------------------------------------------------------------
-function LoadingSkeleton({ mode }: { mode: ViewMode }) {
-  if (mode === "timeline") {
-    return (
-      <div className="rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden animate-pulse">
-        <div className="border-b border-cu-border bg-cu-hover px-4 py-2.5">
-          <div className="h-3 w-64 rounded bg-cu-border" />
-        </div>
-        <div className="divide-y divide-cu-border">
-          {Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="flex items-center gap-4 px-4 py-2.5">
-              <div className="h-3 w-40 rounded bg-cu-hover" />
-              <div className="h-3 w-16 rounded bg-cu-hover" />
-              <div className="h-3 w-20 rounded bg-cu-hover" />
-              <div className="h-3 w-16 rounded bg-cu-hover" />
-              <div className="h-3 w-16 rounded bg-cu-hover" />
-              <div className="h-3 w-10 rounded bg-cu-hover" />
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  }
-
-  if (mode === "person") {
-    return (
-      <div className="space-y-3">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <div
-            key={i}
-            className="animate-pulse rounded-xl border border-cu-border bg-cu-panel p-4 shadow-sm"
-          >
-            <div className="flex items-center gap-3 mb-3">
-              <div className="h-8 w-8 shrink-0 rounded-full bg-cu-hover" />
-              <div className="flex-1 space-y-1.5">
-                <div className="h-3 w-32 rounded bg-cu-hover" />
-                <div className="h-2.5 w-24 rounded bg-cu-hover" />
-              </div>
-              <div className="h-5 w-8 rounded-full bg-cu-hover" />
-            </div>
-            <div className="flex gap-1.5">
-              {[0, 1, 2].map((j) => (
-                <div key={j} className="h-5 w-16 rounded-full bg-cu-hover" />
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-    );
-  }
-
-  // Project mode skeleton
-  return (
-    <div className="space-y-4">
-      {Array.from({ length: 3 }).map((_, i) => (
-        <div
-          key={i}
-          className="animate-pulse rounded-xl border border-cu-border bg-cu-panel shadow-sm overflow-hidden"
-        >
-          <div className="flex items-center gap-2 px-4 py-3">
-            <div className="h-4 w-4 rounded bg-cu-hover" />
-            <div className="h-3 flex-1 max-w-[160px] rounded bg-cu-hover" />
-            <div className="h-4 w-8 rounded-full bg-cu-hover" />
-          </div>
-          <div className="border-t border-cu-border px-4 py-2 space-y-2">
-            {Array.from({ length: 4 }).map((_, j) => (
-              <div key={j} className="flex items-center gap-2">
-                <div className="h-2.5 w-2.5 rounded-full bg-cu-hover" />
-                <div className="h-2.5 flex-1 rounded bg-cu-hover" />
-                <div className="h-2.5 w-12 rounded bg-cu-hover" />
-              </div>
-            ))}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Stat chip
-// ---------------------------------------------------------------------------
-function StatChip({
-  label,
-  value,
-  warn,
-}: {
-  label: string;
-  value: number;
-  warn?: boolean;
-}) {
   return (
     <div
       className={cn(
-        "flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px]",
-        warn && value > 0
-          ? "border-red-200 bg-red-50 text-red-700"
-          : "border-cu-border bg-cu-panel text-cu-text-secondary"
+        "group border-b border-cu-border/50 last:border-b-0 transition-colors",
+        highlightOverdue && "bg-red-50/30 hover:bg-red-50/50",
+        highlightCompleted && !highlightOverdue && "bg-green-50/20 hover:bg-green-50/40",
+        !highlightOverdue && !highlightCompleted && "hover:bg-cu-hover"
       )}
     >
-      <span className={cn("text-[15px] font-bold", warn && value > 0 ? "text-red-700" : "text-cu-text")}>
-        {value}
-      </span>
-      {label}
+      {/* Main row */}
+      <div
+        className="flex min-w-0 cursor-pointer items-center gap-2.5 px-3 py-2"
+        onClick={() => setExpanded((v) => !v)}
+      >
+        {/* Expand chevron */}
+        <span className="shrink-0 text-cu-text-tertiary">
+          {expanded ? (
+            <ChevronDown className="h-3 w-3" />
+          ) : (
+            <ChevronRight className="h-3 w-3 opacity-40 group-hover:opacity-100" />
+          )}
+        </span>
+
+        {/* Status dot */}
+        <span
+          className="h-2.5 w-2.5 shrink-0 rounded-full"
+          style={{ backgroundColor: task.status.color || "var(--cu-text-tertiary)" }}
+          title={task.status.status}
+        />
+
+        {/* Task name */}
+        <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-cu-text">
+          {task.name}
+        </span>
+
+        {/* Assignee avatars */}
+        {task.assignees.length > 0 && (
+          <div className="hidden shrink-0 items-center -space-x-1 sm:flex">
+            {visibleAssignees.map((a) => (
+              <AssigneeAvatar
+                key={a.id}
+                user={{
+                  username: a.username,
+                  email: a.email,
+                  color: a.color,
+                  profilePicture: a.profilePicture,
+                  initials: a.initials,
+                }}
+                size={18}
+              />
+            ))}
+            {overflowAssignees > 0 && (
+              <span className="flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-full bg-cu-hover px-0.5 text-[9px] font-semibold text-cu-text-secondary">
+                +{overflowAssignees}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Status badge */}
+        <div className="hidden shrink-0 sm:block">
+          <StatusBadge task={task} />
+        </div>
+
+        {/* Due date */}
+        {dueMs && (
+          <span
+            className={cn(
+              "shrink-0 text-[11px] font-medium tabular-nums",
+              highlightOverdue ? "text-red-500 font-bold" : "text-cu-text-tertiary"
+            )}
+          >
+            {format(new Date(dueMs), "MMM d")}
+          </span>
+        )}
+
+        {/* Days late badge */}
+        {late !== null && late > 0 && (
+          <span className="shrink-0 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-bold text-white">
+            {late}d late
+          </span>
+        )}
+
+        {/* Completion date */}
+        {showCompletedDate && closedMs && (
+          <span className="shrink-0 text-[11px] font-medium text-emerald-600 tabular-nums">
+            ✓ {format(new Date(closedMs), "MMM d")}
+          </span>
+        )}
+
+        {/* Open in ClickUp */}
+        <a
+          href={task.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(e) => e.stopPropagation()}
+          className="shrink-0 text-cu-text-tertiary opacity-0 transition-opacity group-hover:opacity-100 hover:text-cu-purple"
+          title="Open in ClickUp"
+        >
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      </div>
+
+      {/* Expanded details */}
+      {expanded && (
+        <div className="border-t border-cu-border/50 bg-cu-hover/50 px-9 py-3 space-y-2">
+          {/* All assignees */}
+          {task.assignees.length > 0 && (
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] font-medium text-cu-text-tertiary w-20 shrink-0">
+                Assignees
+              </span>
+              <div className="flex flex-wrap gap-1.5">
+                {task.assignees.map((a) => (
+                  <div key={a.id} className="flex items-center gap-1 rounded-full bg-cu-panel border border-cu-border px-1.5 py-0.5">
+                    <AssigneeAvatar
+                      user={{
+                        username: a.username,
+                        email: a.email,
+                        color: a.color,
+                        profilePicture: a.profilePicture,
+                        initials: a.initials,
+                      }}
+                      size={14}
+                    />
+                    <span className="text-[11px] text-cu-text-secondary">
+                      {a.username ?? a.email}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Dates */}
+          <div className="flex flex-wrap gap-4">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] font-medium text-cu-text-tertiary">Created</span>
+              <span className="text-[11px] text-cu-text-secondary">
+                {format(new Date(Number(task.date_created)), "MMM d, yyyy")}
+              </span>
+            </div>
+            {dueMs && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[11px] font-medium text-cu-text-tertiary">Due</span>
+                <span className={cn("text-[11px]", highlightOverdue ? "font-bold text-red-500" : "text-cu-text-secondary")}>
+                  {format(new Date(dueMs), "MMM d, yyyy")}
+                </span>
+              </div>
+            )}
+            {closedMs && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-[11px] font-medium text-cu-text-tertiary">Completed</span>
+                <span className="text-[11px] text-emerald-600 font-medium">
+                  {format(new Date(closedMs), "MMM d, yyyy")}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* List location */}
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] font-medium text-cu-text-tertiary w-20 shrink-0">List</span>
+            <span className="text-[11px] text-cu-text-secondary">
+              {task.folder.hidden ? "" : `${task.folder.name} / `}{task.list.name}
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Filter logic (client-side, two-mode)
+// TaskList
 // ---------------------------------------------------------------------------
 
-function filterTaskFn(
-  task: CUTask,
-  filterMode: FilterMode,
-  asOfDate: string,
-  statusFilter: StatusFilter,
-  searchText: string,
-  assigneeFilter: number | null,
-  periodStartDate: string,
-  periodEndDate: string
-): boolean {
-  // Search filter always applies
-  if (searchText && !task.name.toLowerCase().includes(searchText.toLowerCase()))
-    return false;
+interface TaskListProps {
+  tasks: CUTask[];
+  tab: PeriodTab | CumulativeTab;
+  periodEndMs?: number; // for overdue "days late" in period view
+  cutoffMs?: number;    // for overdue "days late" in cumulative view
+  searchTerm: string;
+  statusFilter: string;
+}
 
-  // Assignee filter
-  if (assigneeFilter !== null && !task.assignees.some((a) => a.id === assigneeFilter))
-    return false;
-
-  const asOfMs =
-    filterMode === "as-of-date" ? new Date(asOfDate).getTime() : Date.now();
-
-  // Period mode: show tasks that had activity during [periodStart, periodEnd]
-  const periodStart = filterMode === "period" ? new Date(periodStartDate).getTime() : 0;
-  const periodEnd   = filterMode === "period" ? new Date(periodEndDate).getTime() + 86400000 : 0; // inclusive end of day
-
-  if (filterMode === "period") {
-    switch (statusFilter) {
-      case "overdue":
-        // Due date falls within the period AND not closed
-        return !!(task.due_date &&
-          Number(task.due_date) >= periodStart &&
-          Number(task.due_date) <= periodEnd &&
-          task.status.type !== "closed");
-
-      case "closed":
-        // Closed during the period
-        return !!(task.date_closed &&
-          Number(task.date_closed) >= periodStart &&
-          Number(task.date_closed) <= periodEnd);
-
-      case "open":
-        // Created during the period and still open
-        return Number(task.date_created) >= periodStart &&
-          Number(task.date_created) <= periodEnd &&
-          task.status.type === "open";
-
-      case "custom":
-        // Active tasks updated during the period
-        return Number(task.date_updated) >= periodStart &&
-          Number(task.date_updated) <= periodEnd &&
-          task.status.type === "custom";
-
-      case "all":
-      default:
-        // Any task created OR updated OR due within the period
-        return (
-          (Number(task.date_created) >= periodStart && Number(task.date_created) <= periodEnd) ||
-          (Number(task.date_updated) >= periodStart && Number(task.date_updated) <= periodEnd) ||
-          (task.due_date && Number(task.due_date) >= periodStart && Number(task.due_date) <= periodEnd) ||
-          false
-        );
+function TaskList({ tasks, tab, periodEndMs, cutoffMs, searchTerm, statusFilter }: TaskListProps) {
+  const filtered = useMemo(() => {
+    let result = tasks;
+    if (searchTerm) {
+      const lower = searchTerm.toLowerCase();
+      result = result.filter((t) => t.name.toLowerCase().includes(lower));
     }
+    if (statusFilter && statusFilter !== "__all__") {
+      result = result.filter((t) => t.status.status === statusFilter);
+    }
+    return result;
+  }, [tasks, searchTerm, statusFilter]);
+
+  if (filtered.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-2 py-12 text-center">
+        <p className="text-[13px] font-medium text-cu-text-secondary">No tasks match the current filters</p>
+        {(searchTerm || statusFilter !== "__all__") && (
+          <p className="text-[12px] text-cu-text-tertiary">Try clearing the search or status filter</p>
+        )}
+      </div>
+    );
   }
 
-  if (statusFilter !== "all") {
-    if (filterMode === "current") {
-      if (statusFilter === "overdue")
-        return !!(
-          task.due_date &&
-          Number(task.due_date) < Date.now() &&
-          task.status.type !== "closed"
-        );
-      if (statusFilter === "open") return task.status.type === "open";
-      if (statusFilter === "custom") return task.status.type === "custom";
-      if (statusFilter === "closed") return task.status.type === "closed";
-    } else {
-      // Point-in-time
-      if (statusFilter === "overdue")
-        return !!(
-          task.due_date &&
-          Number(task.due_date) < asOfMs &&
-          (!task.date_closed || Number(task.date_closed) > asOfMs)
-        );
-      if (statusFilter === "open")
-        return (
-          Number(task.date_created) <= asOfMs &&
-          (!task.date_closed || Number(task.date_closed) > asOfMs) &&
-          task.status.type !== "closed"
-        );
-      if (statusFilter === "custom")
-        return (
-          Number(task.date_created) <= asOfMs &&
-          (!task.date_closed || Number(task.date_closed) > asOfMs)
-        );
-      if (statusFilter === "closed")
-        return !!(
-          task.date_closed && Number(task.date_closed) <= asOfMs
-        );
-    }
-  } else {
-    // All tasks: in point-in-time mode only show tasks that existed on that date
-    if (filterMode === "as-of-date") {
-      return Number(task.date_created) <= asOfMs;
-    }
-  }
+  const isOverdueTab = tab === "overdue";
+  const isCompletedTab = tab === "completed";
+  const refMs = periodEndMs ?? cutoffMs ?? Date.now();
 
-  return true;
+  return (
+    <div className="divide-y-0">
+      {filtered.map((task) => (
+        <TaskRow
+          key={task.id}
+          task={task}
+          highlightOverdue={isOverdueTab}
+          highlightCompleted={isCompletedTab}
+          showCompletedDate={isCompletedTab}
+          referenceMs={refMs}
+        />
+      ))}
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Main page
+// Responsible Persons strip
 // ---------------------------------------------------------------------------
 
-export default function SpaceDetailPage() {
-  const router = useRouter();
-  const params = useParams();
-  const spaceId = params.spaceId as string;
+interface ResponsiblePerson {
+  id: number;
+  name: string;
+  email: string;
+  color: string | null;
+  avatar: string | null;
+  initials: string;
+  count: number;
+}
 
-  const [viewMode, setViewMode] = useState<ViewMode>("project");
+interface ResponsibleStripProps {
+  tasks: CUTask[];
+  assigneeFilter: number | null;
+  onToggle: (id: number) => void;
+  onClear: () => void;
+}
 
-  const { data, isLoading, isFetching, refetch, dataUpdatedAt, error } = useQuery<SpaceDetailResponse>({
-    queryKey: ["space", spaceId],
-    queryFn: async () => {
-      const r = await fetch(`/api/clickup/space/${spaceId}`);
-      if (!r.ok) {
-        let body = "";
-        try {
-          body = await r.text();
-        } catch {
-          /* */
-        }
-        throw new Error(body || `HTTP ${r.status}`);
-      }
-      return r.json() as Promise<SpaceDetailResponse>;
-    },
-    staleTime: 5 * 60 * 1000,
-    refetchInterval: 30_000,
-    refetchIntervalInBackground: false,
-    retry: 1,
-  });
-
-  const hasError = !!error;
-  const errMessage = hasError ? String(error).replace(/^Error:\s*/, "") : null;
-
-  const space = data?.space;
-  const stats = data?.stats;
-  const hasNoTasks = !isLoading && data && stats?.totalTasks === 0;
-
-  // ── Live sync indicator ──────────────────────────────────────────────────
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, []);
-  const secondsAgo = dataUpdatedAt ? Math.round((now - dataUpdatedAt) / 1000) : null;
-  const timeLabel =
-    secondsAgo === null
-      ? "—"
-      : secondsAgo < 60
-        ? `${secondsAgo}s ago`
-        : `${Math.round(secondsAgo / 60)}m ago`;
-
-  // Countdown to next refresh
-  const [countdown, setCountdown] = useState(30);
-  useEffect(() => {
-    const t = setInterval(() => {
-      setCountdown((c) => {
-        if (c <= 1) { return 30; }
-        return c - 1;
-      });
-    }, 1000);
-    return () => clearInterval(t);
-  }, []);
-
-  // ── Filter state ─────────────────────────────────────────────────────────
-  const [filterMode, setFilterMode] = useState<FilterMode>("current");
-  const [asOfDate, setAsOfDate] = useState<string>(
-    format(new Date(), "yyyy-MM-dd")
-  );
-  const [periodStartDate, setPeriodStartDate] = useState<string>(
-    format(subDays(new Date(), 30), "yyyy-MM-dd")
-  );
-  const [periodEndDate, setPeriodEndDate] = useState<string>(
-    format(new Date(), "yyyy-MM-dd")
-  );
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [searchTerm, setSearchTerm] = useState("");
-  const [assigneeFilter, setAssigneeFilter] = useState<number | null>(null);
-
-  const filterTask = useCallback(
-    (task: CUTask): boolean =>
-      filterTaskFn(task, filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter, periodStartDate, periodEndDate),
-    [filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter, periodStartDate, periodEndDate]
-  );
-
-  const filteredByList = useMemo(
-    () => data?.byList.map((e) => ({ ...e, tasks: e.tasks.filter(filterTask) })) ?? [],
-    [data, filterTask]
-  );
-  const filteredByAssignee = useMemo(
-    () => data?.byAssignee.map((e) => ({ ...e, tasks: e.tasks.filter(filterTask) })) ?? [],
-    [data, filterTask]
-  );
-  const filteredUnassignedTasks = useMemo(
-    () => (data?.unassignedTasks ?? []).filter(filterTask),
-    [data, filterTask]
-  );
-  const filteredTasks = useMemo(
-    () => (data?.tasks ?? []).filter(filterTask),
-    [data, filterTask]
-  );
-
-  // ── Responsible persons (from filtered tasks) ────────────────────────────
-  const responsiblePersons = useMemo(() => {
-    const map = new Map<
-      number,
-      {
-        id: number;
-        name: string;
-        email: string;
-        color: string | null;
-        avatar: string | null;
-        initials: string;
-        count: number;
-      }
-    >();
-    for (const task of filteredTasks) {
+function ResponsibleStrip({ tasks, assigneeFilter, onToggle, onClear }: ResponsibleStripProps) {
+  const persons = useMemo<ResponsiblePerson[]>(() => {
+    const map = new Map<number, ResponsiblePerson>();
+    for (const task of tasks) {
       for (const a of task.assignees) {
-        const existing = map.get(a.id);
-        if (existing) {
-          existing.count++;
+        const ex = map.get(a.id);
+        if (ex) {
+          ex.count++;
         } else {
           map.set(a.id, {
             id: a.id,
@@ -1183,433 +552,719 @@ export default function SpaceDetailPage() {
       }
     }
     return Array.from(map.values()).sort((a, b) => b.count - a.count);
-  }, [filteredTasks]);
+  }, [tasks]);
 
-  // ── Per-status counts (for summary bar) ───────────────────────────────────
-  const filteredStatusCounts = useMemo(() => {
-    const nowMs = Date.now();
-    let open = 0, inProgress = 0, closed = 0, overdue = 0;
-    for (const task of filteredTasks) {
-      if (task.status.type === "open") open++;
-      else if (task.status.type === "custom") inProgress++;
-      else if (task.status.type === "closed" || task.status.type === "done") closed++;
-      if (
-        task.due_date &&
-        Number(task.due_date) < nowMs &&
-        task.status.type !== "closed" &&
-        task.status.type !== "done"
-      )
-        overdue++;
-    }
-    return { open, inProgress, closed, overdue };
-  }, [filteredTasks]);
-
-  // ── Tab counts ───────────────────────────────────────────────────────────
-  const tabCounts = useMemo(
-    () => ({
-      project: data?.byList.length ?? 0,
-      person: data?.byAssignee.length ?? 0,
-      timeline: data?.tasks.filter((t) => t.due_date || t.start_date).length ?? 0,
-    }),
-    [data]
-  );
+  if (persons.length === 0) return null;
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      {/* ── Header ──────────────────────────────────────────────────────────── */}
+    <div className="flex flex-wrap items-center gap-1.5 px-6 py-2.5 border-b border-cu-border bg-cu-panel/60">
+      <span className="shrink-0 text-[11px] font-semibold text-cu-text-tertiary mr-1">
+        Responsible:
+      </span>
+      {persons.slice(0, 14).map((p) => (
+        <button
+          key={p.id}
+          onClick={() => onToggle(p.id)}
+          title={p.email}
+          className={cn(
+            "flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
+            assigneeFilter === p.id
+              ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+              : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/50 hover:text-cu-text"
+          )}
+        >
+          <AssigneeAvatar
+            user={{
+              username: p.name,
+              email: p.email,
+              color: p.color,
+              profilePicture: p.avatar,
+              initials: p.initials,
+            }}
+            size={16}
+          />
+          <span className="max-w-[72px] truncate">{p.name}</span>
+          <span className="rounded-full bg-cu-hover px-1 text-[10px] font-semibold text-cu-text-tertiary">
+            {p.count}
+          </span>
+        </button>
+      ))}
+      {persons.length > 14 && (
+        <span className="text-[11px] text-cu-text-tertiary">+{persons.length - 14} more</span>
+      )}
+      {assigneeFilter !== null && (
+        <button
+          onClick={onClear}
+          className="rounded-full border border-cu-border px-2 py-0.5 text-[11px] text-cu-text-tertiary transition-colors hover:border-red-300 hover:text-red-500"
+        >
+          Clear ×
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Tab navigation
+// ---------------------------------------------------------------------------
+
+interface TabDef {
+  id: string;
+  label: string;
+  count: number;
+  color: string;
+}
+
+function TabNav({
+  tabs,
+  active,
+  onSelect,
+}: {
+  tabs: TabDef[];
+  active: string;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="flex items-end gap-0 px-6 border-b border-cu-border bg-cu-panel">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          onClick={() => onSelect(tab.id)}
+          className={cn(
+            "relative flex items-center gap-2 px-4 py-2.5 text-[13px] font-medium transition-colors",
+            active === tab.id
+              ? "text-cu-text"
+              : "text-cu-text-tertiary hover:text-cu-text-secondary"
+          )}
+        >
+          {tab.label}
+          <span
+            className={cn(
+              "rounded-full px-1.5 py-0.5 text-[10px] font-bold tabular-nums",
+              active === tab.id ? "text-white" : "text-cu-text-tertiary bg-cu-hover"
+            )}
+            style={active === tab.id ? { backgroundColor: tab.color } : undefined}
+          >
+            {tab.count}
+          </span>
+          {active === tab.id && (
+            <span
+              className="absolute bottom-0 left-0 right-0 h-[2.5px] rounded-t-full"
+              style={{ backgroundColor: tab.color }}
+            />
+          )}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Stat strip
+// ---------------------------------------------------------------------------
+
+interface StripStatProps {
+  label: string;
+  value: number;
+  color?: string;
+  warn?: boolean;
+}
+
+function StripStat({ label, value, color, warn }: StripStatProps) {
+  return (
+    <div
+      className={cn(
+        "flex flex-col items-center justify-center rounded-xl border px-5 py-3 min-w-[90px]",
+        warn && value > 0
+          ? "border-red-200 bg-red-50"
+          : "border-cu-border bg-cu-panel"
+      )}
+    >
+      <span
+        className="text-[22px] font-bold tabular-nums leading-none"
+        style={{ color: warn && value > 0 ? "#ef4444" : color ?? "var(--cu-text)" }}
+      >
+        {value}
+      </span>
+      <span className="mt-1 text-[11px] font-medium text-cu-text-tertiary">{label}</span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main page
+// ---------------------------------------------------------------------------
+
+export default function SpaceDetailPage() {
+  const router = useRouter();
+  const params = useParams();
+  const spaceId = params.spaceId as string;
+
+  // ── Data fetch ────────────────────────────────────────────────────────────
+  const { data, isLoading, isFetching, refetch, dataUpdatedAt, error } =
+    useQuery<SpaceDetailResponse>({
+      queryKey: ["space", spaceId],
+      queryFn: async () => {
+        const r = await fetch(`/api/clickup/space/${spaceId}`);
+        if (!r.ok) {
+          let body = "";
+          try { body = await r.text(); } catch { /* */ }
+          throw new Error(body || `HTTP ${r.status}`);
+        }
+        return r.json() as Promise<SpaceDetailResponse>;
+      },
+      staleTime: 5 * 60 * 1000,
+      refetchInterval: 30_000,
+      refetchIntervalInBackground: false,
+      retry: 1,
+    });
+
+  const hasError = !!error;
+  const errMessage = hasError ? String(error).replace(/^Error:\s*/, "") : null;
+  const space = data?.space;
+  const stats = data?.stats;
+
+  // ── Live sync countdown ───────────────────────────────────────────────────
+  const [countdown, setCountdown] = useState(30);
+  useEffect(() => {
+    const t = setInterval(() => setCountdown((c) => (c <= 1 ? 30 : c - 1)), 1000);
+    return () => clearInterval(t);
+  }, []);
+  // Reset countdown when data refreshes
+  useEffect(() => { setCountdown(30); }, [dataUpdatedAt]);
+
+  // ── Main view toggle ──────────────────────────────────────────────────────
+  const [mainView, setMainView] = useState<MainView>("period");
+
+  // ── Period view state ─────────────────────────────────────────────────────
+  const [periodPreset, setPeriodPreset] = useState<PeriodPreset>("thismonth");
+  const [customPeriodStart, setCustomPeriodStart] = useState(
+    format(startOfMonth(new Date()), "yyyy-MM-dd")
+  );
+  const [customPeriodEnd, setCustomPeriodEnd] = useState(todayStr());
+  const [periodTab, setPeriodTab] = useState<PeriodTab>("opened");
+
+  // ── Cumulative view state ─────────────────────────────────────────────────
+  const [cumulativePreset, setCumulativePreset] = useState<CumulativePreset>("today");
+  const [customCutoffDate, setCustomCutoffDate] = useState(todayStr());
+  const [cumulativeTab, setCumulativeTab] = useState<CumulativeTab>("stillopen");
+
+  // ── Shared filter state ───────────────────────────────────────────────────
+  const [assigneeFilter, setAssigneeFilter] = useState<number | null>(null);
+  const [searchTerm, setSearchTerm] = useState("");
+  const [statusFilter, setStatusFilter] = useState("__all__");
+  const [analyticsOpen, setAnalyticsOpen] = useState(false);
+
+  // ── Compute period range ──────────────────────────────────────────────────
+  const { periodStartMs, periodEndMs } = useMemo(() => {
+    const today = new Date();
+    switch (periodPreset) {
+      case "thismonth":
+        return {
+          periodStartMs: startOfMonth(today).getTime(),
+          periodEndMs: today.getTime(),
+        };
+      case "lastmonth": {
+        const lm = subMonths(today, 1);
+        return {
+          periodStartMs: startOfMonth(lm).getTime(),
+          periodEndMs: endOfMonth(lm).getTime(),
+        };
+      }
+      case "last3months":
+        return {
+          periodStartMs: subMonths(today, 3).getTime(),
+          periodEndMs: today.getTime(),
+        };
+      case "custom":
+      default:
+        return {
+          periodStartMs: msForDate(customPeriodStart),
+          periodEndMs: msForDateEndOfDay(customPeriodEnd),
+        };
+    }
+  }, [periodPreset, customPeriodStart, customPeriodEnd]);
+
+  // ── Compute cutoff ────────────────────────────────────────────────────────
+  const cutoffMs = useMemo(() => {
+    const today = new Date();
+    switch (cumulativePreset) {
+      case "today":
+        return today.getTime();
+      case "endlastmonth":
+        return endOfMonth(subMonths(today, 1)).getTime();
+      case "6monthsago":
+        return subMonths(today, 6).getTime();
+      case "custom":
+      default:
+        return msForDateEndOfDay(customCutoffDate);
+    }
+  }, [cumulativePreset, customCutoffDate]);
+
+  // ── Filtered task buckets ─────────────────────────────────────────────────
+  const allTasks = data?.tasks ?? [];
+
+  const applyAssigneeFilter = (tasks: CUTask[]) =>
+    assigneeFilter === null
+      ? tasks
+      : tasks.filter((t) => t.assignees.some((a) => a.id === assigneeFilter));
+
+  const periodBuckets = useMemo(() => {
+    const base = applyAssigneeFilter(allTasks);
+    return {
+      opened: base.filter((t) => filterTaskForPeriod(t, periodStartMs, periodEndMs, "opened")),
+      completed: base.filter((t) => filterTaskForPeriod(t, periodStartMs, periodEndMs, "completed")),
+      overdue: base.filter((t) => filterTaskForPeriod(t, periodStartMs, periodEndMs, "overdue")),
+      inprogress: base.filter((t) => filterTaskForPeriod(t, periodStartMs, periodEndMs, "inprogress")),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allTasks, periodStartMs, periodEndMs, assigneeFilter]);
+
+  const cumulativeBuckets = useMemo(() => {
+    const base = applyAssigneeFilter(allTasks);
+    return {
+      stillopen: base.filter((t) => filterTaskForCumulative(t, cutoffMs, "stillopen")),
+      overdue: base.filter((t) => filterTaskForCumulative(t, cutoffMs, "overdue")),
+      completed: base.filter((t) => filterTaskForCumulative(t, cutoffMs, "completed")),
+      all: base.filter((t) => filterTaskForCumulative(t, cutoffMs, "all")),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allTasks, cutoffMs, assigneeFilter]);
+
+  // ── Tasks for current tab (used in responsible strip + task list) ─────────
+  const currentTabTasks = useMemo(() => {
+    if (mainView === "period") return periodBuckets[periodTab];
+    return cumulativeBuckets[cumulativeTab];
+  }, [mainView, periodTab, cumulativeTab, periodBuckets, cumulativeBuckets]);
+
+  // ── Unique statuses for filter dropdown ───────────────────────────────────
+  const availableStatuses = useMemo(() => {
+    const seen = new Set<string>();
+    for (const t of currentTabTasks) {
+      seen.add(t.status.status);
+    }
+    return Array.from(seen).sort();
+  }, [currentTabTasks]);
+
+  // ── Summary label ─────────────────────────────────────────────────────────
+  const summaryLabel = useMemo(() => {
+    let base = currentTabTasks.length;
+    if (searchTerm || statusFilter !== "__all__") {
+      let f = currentTabTasks;
+      if (searchTerm) f = f.filter((t) => t.name.toLowerCase().includes(searchTerm.toLowerCase()));
+      if (statusFilter !== "__all__") f = f.filter((t) => t.status.status === statusFilter);
+      base = f.length;
+    }
+    if (mainView === "period") {
+      const s = format(new Date(periodStartMs), "MMM d");
+      const e = format(new Date(periodEndMs), "MMM d, yyyy");
+      return `Showing ${base} tasks · Period: ${s} – ${e}`;
+    } else {
+      const d = format(new Date(cutoffMs), "MMM d, yyyy");
+      return `Showing ${base} tasks · Up to: ${d}`;
+    }
+  }, [currentTabTasks, searchTerm, statusFilter, mainView, periodStartMs, periodEndMs, cutoffMs]);
+
+  // ── Period tab defs ───────────────────────────────────────────────────────
+  const periodTabDefs: TabDef[] = [
+    { id: "opened", label: "Opened", count: periodBuckets.opened.length, color: "#3b82f6" },
+    { id: "completed", label: "Completed", count: periodBuckets.completed.length, color: "#10b981" },
+    { id: "overdue", label: "Overdue", count: periodBuckets.overdue.length, color: "#ef4444" },
+    { id: "inprogress", label: "In Progress", count: periodBuckets.inprogress.length, color: "#f59e0b" },
+  ];
+
+  // ── Cumulative tab defs ───────────────────────────────────────────────────
+  const cumulativeTabDefs: TabDef[] = [
+    { id: "stillopen", label: "Still Open", count: cumulativeBuckets.stillopen.length, color: "#3b82f6" },
+    { id: "overdue", label: "Overdue", count: cumulativeBuckets.overdue.length, color: "#ef4444" },
+    { id: "completed", label: "Completed", count: cumulativeBuckets.completed.length, color: "#10b981" },
+    { id: "all", label: "All Tasks", count: cumulativeBuckets.all.length, color: "#8b5cf6" },
+  ];
+
+  const activeTab = mainView === "period" ? periodTab : cumulativeTab;
+  const currentTabDefs = mainView === "period" ? periodTabDefs : cumulativeTabDefs;
+
+  const handleTabSelect = (id: string) => {
+    setSearchTerm("");
+    setStatusFilter("__all__");
+    if (mainView === "period") setPeriodTab(id as PeriodTab);
+    else setCumulativeTab(id as CumulativeTab);
+  };
+
+  const activeTabColor =
+    currentTabDefs.find((t) => t.id === activeTab)?.color ?? "var(--cu-purple)";
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex h-full flex-col overflow-hidden bg-cu-bg">
+
+      {/* ════════════════════════════════════════════════════════════════════
+          HEADER
+      ════════════════════════════════════════════════════════════════════ */}
       <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-3.5">
-        {/* Top row: back button + space name */}
-        <div className="mb-2.5 flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
+          {/* Back */}
           <button
             onClick={() => router.push("/home")}
             className="flex items-center gap-1.5 rounded-lg border border-cu-border px-3 py-1.5 text-[12px] font-medium text-cu-text-secondary transition-colors hover:bg-cu-hover"
           >
             <ArrowLeft className="h-3.5 w-3.5" />
-            Back
+            Back to Projects
           </button>
 
-          {/* Space color swatch + name */}
+          {/* Space identity */}
           {space ? (
-            <div className="flex items-center gap-2.5">
+            <div className="flex items-center gap-2.5 flex-1 min-w-0">
               <span
                 className="h-5 w-5 shrink-0 rounded-md shadow-sm"
                 style={{ backgroundColor: space.color ?? "var(--cu-purple)" }}
               />
-              <h1 className="text-[18px] font-bold text-cu-text">{space.name}</h1>
-              <a
-                href={`https://app.clickup.com/space/${spaceId}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-cu-text-tertiary transition-colors hover:text-cu-purple"
-                title="Open in ClickUp"
-              >
-                <ExternalLink className="h-4 w-4" />
-              </a>
+              <h1 className="text-[17px] font-bold text-cu-text truncate">{space.name}</h1>
             </div>
           ) : (
-            <div className="flex items-center gap-2.5">
-              <div className="h-5 w-5 animate-pulse rounded-md bg-cu-hover" />
+            <div className="flex items-center gap-2.5 flex-1 min-w-0">
+              <div className="h-5 w-5 animate-pulse rounded-md bg-cu-hover shrink-0" />
               <div className="h-5 w-40 animate-pulse rounded bg-cu-hover" />
             </div>
           )}
-        </div>
 
-        {/* Stats row */}
-        {stats && (
-          <div className="flex flex-wrap gap-2">
-            <StatChip label="Total" value={stats.totalTasks} />
-            <StatChip label="Open" value={stats.openTasks} />
-            <StatChip label="In Progress" value={stats.inProgressTasks} />
-            <StatChip label="Closed" value={stats.closedTasks} />
-            <StatChip label="Overdue" value={stats.overdueTasks} warn />
-            <StatChip label="Assignees" value={stats.uniqueAssignees} />
-          </div>
-        )}
-
-        {/* Stats skeleton */}
-        {isLoading && (
-          <div className="flex gap-2">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-8 w-16 animate-pulse rounded-lg bg-cu-hover"
-              />
-            ))}
-          </div>
-        )}
-
-        {/* Live sync indicator */}
-        {dataUpdatedAt > 0 && (
-          <div className="mt-2 flex items-center gap-2 text-[11px] text-cu-text-tertiary">
-            {isFetching ? (
-              <>
-                <RefreshCw className="h-3 w-3 animate-spin text-green-500" />
-                <span className="font-medium text-green-600">Syncing…</span>
-              </>
-            ) : (
-              <>
-                <span className="relative flex h-2 w-2">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
-                  <span className="relative inline-flex h-2 w-2 rounded-full bg-green-500" />
-                </span>
-                <span className="font-medium text-green-600">
-                  Live · refreshes in {countdown}s
-                </span>
-              </>
-            )}
-            <span className="text-cu-border">·</span>
-            <span>Updated {timeLabel}</span>
-            <button
-              onClick={() => refetch()}
-              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-cu-text-secondary transition-colors hover:bg-cu-hover hover:text-cu-text"
-              title="Refresh"
+          {/* Right side actions */}
+          <div className="flex items-center gap-3 shrink-0 ml-auto">
+            {/* Open in ClickUp */}
+            <a
+              href={`https://app.clickup.com/space/${spaceId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 rounded-lg border border-cu-border px-3 py-1.5 text-[12px] font-medium text-cu-text-secondary transition-colors hover:bg-cu-hover hover:text-cu-purple"
             >
-              <RefreshCw className="h-3 w-3" />
-              Refresh
-            </button>
+              <ExternalLink className="h-3.5 w-3.5" />
+              Open in ClickUp
+            </a>
+
+            {/* Live indicator */}
+            {dataUpdatedAt > 0 && (
+              <div className="flex items-center gap-1.5 text-[11px]">
+                {isFetching ? (
+                  <>
+                    <RefreshCw className="h-3 w-3 animate-spin text-green-500" />
+                    <span className="font-medium text-green-600">Syncing…</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="relative flex h-2 w-2">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-green-500" />
+                    </span>
+                    <span className="font-medium text-green-600 hidden sm:inline">
+                      Live · refreshes in {countdown}s
+                    </span>
+                  </>
+                )}
+                <button
+                  onClick={() => refetch()}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-cu-text-tertiary transition-colors hover:bg-cu-hover hover:text-cu-text"
+                  title="Refresh now"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                </button>
+              </div>
+            )}
           </div>
-        )}
+        </div>
       </div>
 
-      {/* ── Error banner ────────────────────────────────────────────────────── */}
+      {/* ════════════════════════════════════════════════════════════════════
+          ERROR BANNER
+      ════════════════════════════════════════════════════════════════════ */}
       {hasError && (
         <div className="shrink-0 border-b border-[#fca5a5] bg-[#fef2f2] px-6 py-2.5">
           <p className="text-[13px] font-medium text-[#991b1b]">
-            Failed to load space data
-            {errMessage ? ` — ${errMessage}` : ""}
+            Failed to load space data{errMessage ? ` — ${errMessage}` : ""}
           </p>
         </div>
       )}
 
-      {/* ── View toggle ─────────────────────────────────────────────────────── */}
-      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6">
-        <div className="flex gap-0">
-          {(
-            [
-              { id: "project" as const, label: "By Project", count: tabCounts.project },
-              { id: "person" as const, label: "By Person", count: tabCounts.person },
-              { id: "timeline" as const, label: "Timeline", count: tabCounts.timeline },
-            ] as const
-          ).map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setViewMode(tab.id)}
-              className={cn(
-                "relative px-4 py-2.5 text-[13px] font-medium transition-colors",
-                viewMode === tab.id
-                  ? "text-cu-purple"
-                  : "text-cu-text-secondary hover:text-cu-text"
-              )}
-            >
-              <span className="flex items-center gap-1.5">
-                {tab.label}
-                {data && tab.count > 0 && (
-                  <span className="rounded-full bg-cu-hover px-1.5 py-0.5 text-[10px] font-medium text-cu-text-secondary">
-                    {tab.count}
-                  </span>
-                )}
-              </span>
-              {viewMode === tab.id && (
-                <span
-                  className="absolute bottom-0 left-0 right-0 h-0.5 rounded-t-full"
-                  style={{ backgroundColor: "var(--cu-purple)" }}
-                />
-              )}
-            </button>
-          ))}
+      {/* ════════════════════════════════════════════════════════════════════
+          STATS STRIP
+      ════════════════════════════════════════════════════════════════════ */}
+      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-3">
+        {isLoading ? (
+          <div className="flex gap-3">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="h-[62px] w-[90px] animate-pulse rounded-xl bg-cu-hover" />
+            ))}
+          </div>
+        ) : stats ? (
+          <div className="flex flex-wrap gap-3">
+            <StripStat label="Total Tasks" value={stats.totalTasks} color="var(--cu-text)" />
+            <StripStat label="Open" value={stats.openTasks} color="#3b82f6" />
+            <StripStat label="Completed" value={stats.closedTasks} color="#10b981" />
+            <StripStat label="Overdue" value={stats.overdueTasks} color="#ef4444" warn />
+          </div>
+        ) : null}
+      </div>
+
+      {/* ════════════════════════════════════════════════════════════════════
+          MAIN VIEW TOGGLE
+      ════════════════════════════════════════════════════════════════════ */}
+      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-3">
+        <div className="inline-flex rounded-lg border border-cu-border bg-cu-hover p-0.5 gap-0.5">
+          <button
+            onClick={() => setMainView("period")}
+            className={cn(
+              "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-colors",
+              mainView === "period"
+                ? "bg-cu-panel text-cu-text shadow-sm"
+                : "text-cu-text-secondary hover:text-cu-text"
+            )}
+          >
+            <Calendar className="h-4 w-4" />
+            Activity in Period
+          </button>
+          <button
+            onClick={() => setMainView("cumulative")}
+            className={cn(
+              "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-colors",
+              mainView === "cumulative"
+                ? "bg-cu-panel text-cu-text shadow-sm"
+                : "text-cu-text-secondary hover:text-cu-text"
+            )}
+          >
+            <BarChart2 className="h-4 w-4" />
+            Status up to Date
+          </button>
         </div>
       </div>
 
-      {/* ── Filter bar ──────────────────────────────────────────────────────── */}
-      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-2.5 space-y-2">
-        {/* Row 1: mode toggle | status pills | search */}
-        <div className="flex flex-wrap items-center gap-3">
-          {/* Filter mode toggle */}
-          <div className="flex items-center gap-1 rounded-lg border border-cu-border bg-cu-hover p-0.5">
-            <button
-              onClick={() => setFilterMode("current")}
-              className={cn(
-                "rounded-md px-3 py-1 text-[11px] font-medium transition-colors",
-                filterMode === "current"
-                  ? "bg-cu-panel text-cu-text shadow-sm"
-                  : "text-cu-text-secondary hover:text-cu-text"
-              )}
-            >
-              Current State
-            </button>
-            <button
-              onClick={() => setFilterMode("as-of-date")}
-              className={cn(
-                "flex items-center gap-1 rounded-md px-3 py-1 text-[11px] font-medium transition-colors",
-                filterMode === "as-of-date"
-                  ? "bg-cu-panel text-cu-text shadow-sm"
-                  : "text-cu-text-secondary hover:text-cu-text"
-              )}
-            >
-              <Calendar className="h-3 w-3" />
-              As of Date
-            </button>
-            <button
-              onClick={() => setFilterMode("period")}
-              className={cn(
-                "flex items-center gap-1 rounded-md px-3 py-1 text-[11px] font-medium transition-colors",
-                filterMode === "period"
-                  ? "bg-cu-panel text-cu-text shadow-sm"
-                  : "text-cu-text-secondary hover:text-cu-text"
-              )}
-            >
-              <Clock className="h-3 w-3" />
-              Time Period
-            </button>
-          </div>
-
-          {/* Divider */}
-          <span className="hidden h-4 w-px bg-cu-border sm:block" />
-
-          {/* Status filter pills */}
-          <div className="flex items-center gap-1">
-            <span className="mr-1 text-[11px] font-medium text-cu-text-tertiary">
-              Status:
-            </span>
+      {/* ════════════════════════════════════════════════════════════════════
+          PERIOD / CUMULATIVE CONTROLS
+      ════════════════════════════════════════════════════════════════════ */}
+      <div className="shrink-0 border-b border-cu-border bg-cu-panel/80 px-6 py-3">
+        {mainView === "period" ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Preset buttons */}
             {(
               [
-                { id: "all" as const, label: "All" },
-                { id: "open" as const, label: "Open" },
-                { id: "custom" as const, label: "In Progress" },
-                { id: "closed" as const, label: "Closed" },
-                { id: "overdue" as const, label: "Overdue" },
+                { id: "thismonth", label: "This Month" },
+                { id: "lastmonth", label: "Last Month" },
+                { id: "last3months", label: "Last 3 Months" },
+                { id: "custom", label: "Custom" },
               ] as const
-            ).map((f) => (
+            ).map((p) => (
               <button
-                key={f.id}
-                onClick={() => setStatusFilter(f.id)}
+                key={p.id}
+                onClick={() => setPeriodPreset(p.id)}
                 className={cn(
-                  "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                  statusFilter === f.id
-                    ? f.id === "overdue"
-                      ? "bg-red-500 text-white"
-                      : "bg-cu-purple text-white"
-                    : "bg-cu-hover text-cu-text-secondary hover:text-cu-text"
+                  "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
+                  periodPreset === p.id
+                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/40 hover:text-cu-text"
                 )}
               >
-                {f.label}
+                {p.label}
               </button>
             ))}
+
+            {/* Custom date range */}
+            {periodPreset === "custom" && (
+              <div className="flex items-center gap-2 ml-1">
+                <span className="text-[11px] font-medium text-cu-text-tertiary">From</span>
+                <input
+                  type="date"
+                  value={customPeriodStart}
+                  onChange={(e) => setCustomPeriodStart(e.target.value)}
+                  className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                />
+                <span className="text-[11px] font-medium text-cu-text-tertiary">→</span>
+                <input
+                  type="date"
+                  value={customPeriodEnd}
+                  onChange={(e) => setCustomPeriodEnd(e.target.value)}
+                  className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                />
+              </div>
+            )}
           </div>
+        ) : (
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Preset buttons */}
+            {(
+              [
+                { id: "today", label: "Today" },
+                { id: "endlastmonth", label: "End of Last Month" },
+                { id: "6monthsago", label: "6 Months Ago" },
+                { id: "custom", label: "Custom" },
+              ] as const
+            ).map((p) => (
+              <button
+                key={p.id}
+                onClick={() => setCumulativePreset(p.id)}
+                className={cn(
+                  "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
+                  cumulativePreset === p.id
+                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/40 hover:text-cu-text"
+                )}
+              >
+                {p.label}
+              </button>
+            ))}
 
-          {/* Divider */}
-          <span className="hidden h-4 w-px bg-cu-border sm:block" />
-
-          {/* Search */}
-          <input
-            type="text"
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="🔍 Search tasks…"
-            className="h-7 min-w-[160px] rounded-lg border border-cu-border bg-cu-panel px-2.5 text-[12px] text-cu-text placeholder:text-cu-text-tertiary focus:outline-none focus:ring-1 focus:ring-cu-purple"
-          />
-        </div>
-
-        {/* Row 2 (only in as-of-date mode): date picker */}
-        {filterMode === "as-of-date" && (
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] font-medium text-cu-text-secondary">
-              As of:
-            </span>
-            <input
-              type="date"
-              value={asOfDate}
-              onChange={(e) => setAsOfDate(e.target.value)}
-              className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-            />
-            <span className="text-[11px] text-cu-text-tertiary">
-              Showing tasks as they existed on{" "}
-              <strong>{format(new Date(asOfDate + "T00:00:00"), "MMMM d, yyyy")}</strong>
-            </span>
+            {/* Custom date picker */}
+            {cumulativePreset === "custom" && (
+              <div className="flex items-center gap-2 ml-1">
+                <span className="text-[11px] font-medium text-cu-text-tertiary">As of</span>
+                <input
+                  type="date"
+                  value={customCutoffDate}
+                  onChange={(e) => setCustomCutoffDate(e.target.value)}
+                  className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                />
+              </div>
+            )}
           </div>
         )}
 
-        {/* Row 2 (only in period mode): from/to date pickers + label */}
-        {filterMode === "period" && (
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[11px] font-medium text-cu-text-secondary">
-              From:
-            </span>
-            <input
-              type="date"
-              value={periodStartDate}
-              onChange={(e) => setPeriodStartDate(e.target.value)}
-              className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-            />
-            <span className="text-[11px] font-medium text-cu-text-secondary">
-              To:
-            </span>
-            <input
-              type="date"
-              value={periodEndDate}
-              onChange={(e) => setPeriodEndDate(e.target.value)}
-              className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-            />
-            <span className="text-[11px] text-cu-text-tertiary">
-              Showing tasks from{" "}
-              <strong>{format(parseISO(periodStartDate), "MMM d, yyyy")}</strong>
-              {" → "}
-              <strong>{format(parseISO(periodEndDate), "MMM d, yyyy")}</strong>
-            </span>
-          </div>
+        {/* Summary line */}
+        {!isLoading && data && (
+          <p className="mt-1.5 text-[11px] text-cu-text-tertiary">{summaryLabel}</p>
         )}
       </div>
 
-      {/* ── Scrollable content ──────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
-        {/* Loading skeleton */}
-        {isLoading && <LoadingSkeleton mode={viewMode} />}
+      {/* Responsible persons strip */}
+      {!isLoading && !hasError && data && (
+        <ResponsibleStrip
+          tasks={currentTabTasks}
+          assigneeFilter={assigneeFilter}
+          onToggle={(id) => setAssigneeFilter((prev) => (prev === id ? null : id))}
+          onClear={() => setAssigneeFilter(null)}
+        />
+      )}
 
-        {/* Empty state */}
-        {hasNoTasks && !hasError && (
-          <EmptyState message="No tasks in this space yet. Add tasks in ClickUp." />
-        )}
+      {/* ════════════════════════════════════════════════════════════════════
+          TABS
+      ════════════════════════════════════════════════════════════════════ */}
+      {!isLoading && !hasError && data && (
+        <TabNav
+          tabs={currentTabDefs}
+          active={activeTab}
+          onSelect={handleTabSelect}
+        />
+      )}
 
-        {/* Responsible Persons panel */}
-        {!isLoading && !hasError && data && filteredTasks.length > 0 && responsiblePersons.length > 0 && (
-          <div className="mb-4 flex flex-wrap items-center gap-2">
-            <span className="shrink-0 text-[11px] font-medium text-cu-text-tertiary">
-              Responsible:
-            </span>
-            {responsiblePersons.slice(0, 12).map((person) => (
-              <button
-                key={person.id}
-                onClick={() =>
-                  setAssigneeFilter((prev) =>
-                    prev === person.id ? null : person.id
-                  )
-                }
-                title={person.email}
-                className={cn(
-                  "flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
-                  assigneeFilter !== null && assigneeFilter === person.id
-                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
-                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple hover:text-cu-text"
-                )}
-              >
-                <AssigneeAvatar
-                  user={{
-                    username: person.name,
-                    email: person.email,
-                    color: person.color,
-                    profilePicture: person.avatar,
-                    initials: person.initials,
-                  }}
-                  size={16}
-                />
-                <span className="max-w-[80px] truncate">{person.name}</span>
-                <span className="rounded-full bg-cu-hover px-1 text-[10px] font-semibold text-cu-text-tertiary">
-                  {person.count}
-                </span>
-              </button>
+      {/* ════════════════════════════════════════════════════════════════════
+          SCROLLABLE CONTENT
+      ════════════════════════════════════════════════════════════════════ */}
+      <div className="flex-1 overflow-y-auto">
+
+        {/* Loading state */}
+        {isLoading && (
+          <div className="space-y-2 p-6">
+            {[0, 1, 2, 3, 4, 5].map((i) => (
+              <div key={i} className="flex h-10 animate-pulse items-center gap-3 rounded-lg bg-cu-hover/80 px-4">
+                <div className="h-2.5 w-2.5 rounded-full bg-cu-border" />
+                <div className="h-3 flex-1 rounded bg-cu-border" style={{ maxWidth: `${40 + (i * 13) % 40}%` }} />
+                <div className="h-3 w-14 rounded bg-cu-border" />
+              </div>
             ))}
-            {responsiblePersons.length > 12 && (
-              <span className="text-[11px] text-cu-text-tertiary">
-                +{responsiblePersons.length - 12} more
+          </div>
+        )}
+
+        {/* Main content */}
+        {!isLoading && !hasError && data && (
+          <div>
+            {/* Filter bar */}
+            <div className="flex items-center gap-3 border-b border-cu-border bg-cu-panel/60 px-6 py-2.5">
+              {/* Status filter */}
+              <div className="relative">
+                <select
+                  value={statusFilter}
+                  onChange={(e) => setStatusFilter(e.target.value)}
+                  className="h-7 appearance-none rounded-lg border border-cu-border bg-cu-panel pl-2.5 pr-7 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple cursor-pointer"
+                >
+                  <option value="__all__">All statuses</option>
+                  {availableStatuses.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3 w-3 -translate-y-1/2 text-cu-text-tertiary" />
+              </div>
+
+              {/* Search */}
+              <div className="relative flex items-center">
+                <Search className="absolute left-2 h-3.5 w-3.5 text-cu-text-tertiary pointer-events-none" />
+                <input
+                  type="text"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder="Search by name…"
+                  className="h-7 min-w-[180px] rounded-lg border border-cu-border bg-cu-panel pl-7 pr-2.5 text-[12px] text-cu-text placeholder:text-cu-text-tertiary focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                />
+              </div>
+
+              {/* Active tab indicator dot */}
+              <span className="ml-auto flex items-center gap-1.5 text-[11px] font-medium text-cu-text-tertiary">
+                <span
+                  className="h-2 w-2 rounded-full"
+                  style={{ backgroundColor: activeTabColor }}
+                />
+                {currentTabDefs.find((t) => t.id === activeTab)?.label}
+                {" · "}
+                {currentTabTasks.length} tasks
               </span>
-            )}
-            {assigneeFilter && (
+            </div>
+
+            {/* Task list */}
+            <div className="rounded-none">
+              {currentTabTasks.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-3 py-20 text-center">
+                  <span className="text-4xl">
+                    {activeTab === "completed" ? "✓" : activeTab === "overdue" ? "⏰" : "📋"}
+                  </span>
+                  <p className="text-[14px] font-medium text-cu-text-secondary">No tasks in this category</p>
+                  <p className="text-[12px] text-cu-text-tertiary max-w-xs">
+                    {mainView === "period"
+                      ? "Adjust the period range to see more activity"
+                      : "Adjust the cutoff date to see more tasks"}
+                  </p>
+                </div>
+              ) : (
+                <TaskList
+                  tasks={currentTabTasks}
+                  tab={activeTab as PeriodTab & CumulativeTab}
+                  periodEndMs={mainView === "period" ? periodEndMs : undefined}
+                  cutoffMs={mainView === "cumulative" ? cutoffMs : undefined}
+                  searchTerm={searchTerm}
+                  statusFilter={statusFilter}
+                />
+              )}
+            </div>
+
+            {/* Deep analytics (collapsed) */}
+            <div className="border-t border-cu-border mt-2">
               <button
-                onClick={() => setAssigneeFilter(null)}
-                className="rounded-full border border-cu-border px-2 py-0.5 text-[11px] text-cu-text-tertiary transition-colors hover:border-red-300 hover:text-red-500"
+                onClick={() => setAnalyticsOpen((v) => !v)}
+                className="flex w-full items-center gap-2 px-6 py-3 text-[12px] font-medium text-cu-text-secondary transition-colors hover:bg-cu-hover"
               >
-                Clear filter ×
+                <BarChart2 className="h-4 w-4 text-cu-text-tertiary" />
+                <span>Show analytics</span>
+                {analyticsOpen ? (
+                  <ChevronDown className="ml-auto h-3.5 w-3.5 text-cu-text-tertiary" />
+                ) : (
+                  <ChevronRight className="ml-auto h-3.5 w-3.5 text-cu-text-tertiary" />
+                )}
               </button>
-            )}
-          </div>
-        )}
 
-        {/* Per-status summary counts */}
-        {!isLoading && !hasError && data && filteredTasks.length > 0 && (
-          <div className="mb-4 flex flex-wrap items-center gap-2 text-[12px] text-cu-text-secondary">
-            <span className="font-medium text-cu-text">
-              Showing {filteredTasks.length} tasks
-            </span>
-            <span className="text-cu-border">—</span>
-            <span className="rounded-full border border-cu-border bg-cu-panel px-2 py-0.5">
-              Open:{" "}
-              <strong className="text-cu-text">{filteredStatusCounts.open}</strong>
-            </span>
-            <span className="rounded-full border border-cu-border bg-cu-panel px-2 py-0.5">
-              In Progress:{" "}
-              <strong className="text-cu-text">{filteredStatusCounts.inProgress}</strong>
-            </span>
-            <span className="rounded-full border border-cu-border bg-cu-panel px-2 py-0.5">
-              Closed:{" "}
-              <strong className="text-cu-text">{filteredStatusCounts.closed}</strong>
-            </span>
-            {filteredStatusCounts.overdue > 0 && (
-              <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-red-700">
-                Overdue:{" "}
-                <strong>{filteredStatusCounts.overdue}</strong>
-              </span>
-            )}
+              {analyticsOpen && (
+                <div className="border-t border-cu-border bg-cu-hover/30 px-6 py-5">
+                  {/* Placeholder — wire in your existing analytics components here */}
+                  <p className="text-[12px] text-cu-text-tertiary text-center py-4">
+                    Activity heatmap and space breakdown charts will appear here.
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
-        )}
-
-        {/* Content */}
-        {!isLoading && !hasError && data && stats && stats.totalTasks > 0 && (
-          <>
-            {viewMode === "project" && (
-              <ByProjectView
-                folders={data.folders}
-                folderlessLists={data.folderlessLists}
-                byList={filteredByList}
-              />
-            )}
-            {viewMode === "person" && (
-              <ByPersonView
-                byAssignee={filteredByAssignee}
-                unassignedTasks={filteredUnassignedTasks}
-              />
-            )}
-            {viewMode === "timeline" && <TimelineView tasks={filteredTasks} />}
-          </>
         )}
       </div>
     </div>
