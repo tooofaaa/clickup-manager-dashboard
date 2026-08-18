@@ -3,7 +3,7 @@
 import { useState, useMemo, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { format } from "date-fns";
+import { format, subDays, parseISO } from "date-fns";
 import {
   ArrowLeft,
   Folder,
@@ -95,7 +95,7 @@ interface SpaceDetailResponse {
 // ---------------------------------------------------------------------------
 
 type ViewMode = "project" | "person" | "timeline";
-type FilterMode = "current" | "as-of-date";
+type FilterMode = "current" | "as-of-date" | "period";
 type StatusFilter = "all" | "open" | "custom" | "closed" | "overdue";
 
 // ---------------------------------------------------------------------------
@@ -944,7 +944,9 @@ function filterTaskFn(
   asOfDate: string,
   statusFilter: StatusFilter,
   searchText: string,
-  assigneeFilter: number | null
+  assigneeFilter: number | null,
+  periodStartDate: string,
+  periodEndDate: string
 ): boolean {
   // Search filter always applies
   if (searchText && !task.name.toLowerCase().includes(searchText.toLowerCase()))
@@ -956,6 +958,49 @@ function filterTaskFn(
 
   const asOfMs =
     filterMode === "as-of-date" ? new Date(asOfDate).getTime() : Date.now();
+
+  // Period mode: show tasks that had activity during [periodStart, periodEnd]
+  const periodStart = filterMode === "period" ? new Date(periodStartDate).getTime() : 0;
+  const periodEnd   = filterMode === "period" ? new Date(periodEndDate).getTime() + 86400000 : 0; // inclusive end of day
+
+  if (filterMode === "period") {
+    switch (statusFilter) {
+      case "overdue":
+        // Due date falls within the period AND not closed
+        return !!(task.due_date &&
+          Number(task.due_date) >= periodStart &&
+          Number(task.due_date) <= periodEnd &&
+          task.status.type !== "closed");
+
+      case "closed":
+        // Closed during the period
+        return !!(task.date_closed &&
+          Number(task.date_closed) >= periodStart &&
+          Number(task.date_closed) <= periodEnd);
+
+      case "open":
+        // Created during the period and still open
+        return Number(task.date_created) >= periodStart &&
+          Number(task.date_created) <= periodEnd &&
+          task.status.type === "open";
+
+      case "custom":
+        // Active tasks updated during the period
+        return Number(task.date_updated) >= periodStart &&
+          Number(task.date_updated) <= periodEnd &&
+          task.status.type === "custom";
+
+      case "all":
+      default:
+        // Any task created OR updated OR due within the period
+        return (
+          (Number(task.date_created) >= periodStart && Number(task.date_created) <= periodEnd) ||
+          (Number(task.date_updated) >= periodStart && Number(task.date_updated) <= periodEnd) ||
+          (task.due_date && Number(task.due_date) >= periodStart && Number(task.due_date) <= periodEnd) ||
+          false
+        );
+    }
+  }
 
   if (statusFilter !== "all") {
     if (filterMode === "current") {
@@ -1055,9 +1100,27 @@ export default function SpaceDetailPage() {
         ? `${secondsAgo}s ago`
         : `${Math.round(secondsAgo / 60)}m ago`;
 
+  // Countdown to next refresh
+  const [countdown, setCountdown] = useState(30);
+  useEffect(() => {
+    const t = setInterval(() => {
+      setCountdown((c) => {
+        if (c <= 1) { return 30; }
+        return c - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
+
   // ── Filter state ─────────────────────────────────────────────────────────
   const [filterMode, setFilterMode] = useState<FilterMode>("current");
   const [asOfDate, setAsOfDate] = useState<string>(
+    format(new Date(), "yyyy-MM-dd")
+  );
+  const [periodStartDate, setPeriodStartDate] = useState<string>(
+    format(subDays(new Date(), 30), "yyyy-MM-dd")
+  );
+  const [periodEndDate, setPeriodEndDate] = useState<string>(
     format(new Date(), "yyyy-MM-dd")
   );
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -1066,8 +1129,8 @@ export default function SpaceDetailPage() {
 
   const filterTask = useCallback(
     (task: CUTask): boolean =>
-      filterTaskFn(task, filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter),
-    [filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter]
+      filterTaskFn(task, filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter, periodStartDate, periodEndDate),
+    [filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter, periodStartDate, periodEndDate]
   );
 
   const filteredByList = useMemo(
@@ -1218,19 +1281,30 @@ export default function SpaceDetailPage() {
         {/* Live sync indicator */}
         {dataUpdatedAt > 0 && (
           <div className="mt-2 flex items-center gap-2 text-[11px] text-cu-text-tertiary">
-            <span
-              className={cn(
-                "h-1.5 w-1.5 rounded-full",
-                isFetching ? "animate-pulse bg-green-500" : "bg-gray-400"
-              )}
-            />
+            {isFetching ? (
+              <>
+                <RefreshCw className="h-3 w-3 animate-spin text-green-500" />
+                <span className="font-medium text-green-600">Syncing…</span>
+              </>
+            ) : (
+              <>
+                <span className="relative flex h-2 w-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-green-500" />
+                </span>
+                <span className="font-medium text-green-600">
+                  Live · refreshes in {countdown}s
+                </span>
+              </>
+            )}
+            <span className="text-cu-border">·</span>
             <span>Updated {timeLabel}</span>
             <button
               onClick={() => refetch()}
               className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium text-cu-text-secondary transition-colors hover:bg-cu-hover hover:text-cu-text"
               title="Refresh"
             >
-              <RefreshCw className={cn("h-3 w-3", isFetching && "animate-spin")} />
+              <RefreshCw className="h-3 w-3" />
               Refresh
             </button>
           </div>
@@ -1315,6 +1389,18 @@ export default function SpaceDetailPage() {
               <Calendar className="h-3 w-3" />
               As of Date
             </button>
+            <button
+              onClick={() => setFilterMode("period")}
+              className={cn(
+                "flex items-center gap-1 rounded-md px-3 py-1 text-[11px] font-medium transition-colors",
+                filterMode === "period"
+                  ? "bg-cu-panel text-cu-text shadow-sm"
+                  : "text-cu-text-secondary hover:text-cu-text"
+              )}
+            >
+              <Clock className="h-3 w-3" />
+              Time Period
+            </button>
           </div>
 
           {/* Divider */}
@@ -1379,6 +1465,36 @@ export default function SpaceDetailPage() {
             <span className="text-[11px] text-cu-text-tertiary">
               Showing tasks as they existed on{" "}
               <strong>{format(new Date(asOfDate + "T00:00:00"), "MMMM d, yyyy")}</strong>
+            </span>
+          </div>
+        )}
+
+        {/* Row 2 (only in period mode): from/to date pickers + label */}
+        {filterMode === "period" && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] font-medium text-cu-text-secondary">
+              From:
+            </span>
+            <input
+              type="date"
+              value={periodStartDate}
+              onChange={(e) => setPeriodStartDate(e.target.value)}
+              className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+            />
+            <span className="text-[11px] font-medium text-cu-text-secondary">
+              To:
+            </span>
+            <input
+              type="date"
+              value={periodEndDate}
+              onChange={(e) => setPeriodEndDate(e.target.value)}
+              className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+            />
+            <span className="text-[11px] text-cu-text-tertiary">
+              Showing tasks from{" "}
+              <strong>{format(parseISO(periodStartDate), "MMM d, yyyy")}</strong>
+              {" → "}
+              <strong>{format(parseISO(periodEndDate), "MMM d, yyyy")}</strong>
             </span>
           </div>
         )}

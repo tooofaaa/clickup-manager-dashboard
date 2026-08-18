@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { RefreshCw, Loader2, LayoutGrid, CheckSquare, AlertTriangle, Users } from "lucide-react";
@@ -153,7 +154,18 @@ export default function ProjectsPage() {
     queryKey: ["projects-overview"],
     queryFn: () => apiGet("/api/clickup/team-eval"),
     refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
   });
+
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 10000);
+    return () => clearInterval(t);
+  }, []);
+  const secondsAgo = Math.round((now - dataUpdatedAt) / 1000);
+  const timeLabel = dataUpdatedAt > 0
+    ? (secondsAgo < 60 ? `${secondsAgo}s ago` : `${Math.round(secondsAgo / 60)}m ago`)
+    : "Loading...";
 
   const insights = data?.insights;
   const spaces = insights?.tasksBySpace ?? [];
@@ -166,25 +178,29 @@ export default function ProjectsPage() {
         <div>
           <h1 className="text-2xl font-bold text-cu-text">Projects</h1>
           <p className="mt-0.5 text-sm text-cu-text-secondary">All Spaces</p>
-          {dataUpdatedAt ? (
-            <p className="mt-0.5 text-xs text-cu-text-tertiary">
-              Last synced at {formatTime(dataUpdatedAt)}
-            </p>
-          ) : null}
+          <p className="mt-0.5 text-xs text-cu-text-tertiary">
+            Last updated: {timeLabel}
+          </p>
         </div>
 
-        <button
-          onClick={() => refetch()}
-          disabled={isFetching}
-          className="flex items-center gap-1.5 rounded-lg border border-cu-border bg-cu-panel px-3 py-1.5 text-sm font-medium text-cu-text-secondary shadow-sm transition-colors hover:border-cu-purple hover:text-cu-purple disabled:opacity-60"
-        >
-          {isFetching ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <RefreshCw className="h-4 w-4" />
-          )}
-          {isFetching ? "Syncing…" : "Refresh"}
-        </button>
+        <div className="flex items-center gap-3">
+          <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+            <span className="text-[10px]">●</span>
+            Live · auto-syncs every 60s
+          </span>
+          <button
+            onClick={() => refetch()}
+            disabled={isFetching}
+            className="flex items-center gap-1.5 rounded-lg border border-cu-border bg-cu-panel px-3 py-1.5 text-sm font-medium text-cu-text-secondary shadow-sm transition-colors hover:border-cu-purple hover:text-cu-purple disabled:opacity-60"
+          >
+            {isFetching ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+            {isFetching ? "Syncing…" : "Refresh"}
+          </button>
+        </div>
       </div>
 
       {/* KPI summary cards */}

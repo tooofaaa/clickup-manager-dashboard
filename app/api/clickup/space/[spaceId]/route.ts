@@ -117,6 +117,8 @@ export async function GET(
 ) {
   const { searchParams } = new URL(req.url);
   const asOfParam = searchParams.get("asOf");
+  const periodStartMs = parseTimestamp(searchParams.get("periodStart"));
+  const periodEndMs   = parseTimestamp(searchParams.get("periodEnd"));
 
   const teamId = process.env.CLICKUP_TEAM_ID;
   if (!teamId) {
@@ -336,6 +338,48 @@ export async function GET(
     };
   }
 
+  // ── periodSnapshot ─────────────────────────────────────────────────────────
+  type PeriodSnapshot = {
+    periodStart: number;
+    periodEnd: number;
+    createdInPeriod: number;
+    closedInPeriod: number;
+    overdueInPeriod: number;
+    activeInPeriod: number;
+    responsibleInPeriod: ReturnType<typeof getResponsiblePersons>;
+  };
+
+  let periodSnapshot: PeriodSnapshot | null = null;
+
+  if (periodStartMs && periodEndMs) {
+    const periodEnd = periodEndMs + 86400000; // make end of day inclusive
+
+    periodSnapshot = {
+      periodStart: periodStartMs,
+      periodEnd: periodEndMs,
+      // Tasks created in this period
+      createdInPeriod: tasks.filter(t =>
+        Number(t.date_created) >= periodStartMs && Number(t.date_created) <= periodEnd
+      ).length,
+      // Tasks closed in this period
+      closedInPeriod: tasks.filter(t =>
+        t.date_closed && Number(t.date_closed) >= periodStartMs && Number(t.date_closed) <= periodEnd
+      ).length,
+      // Tasks overdue within this period (due date falls in period AND still not closed)
+      overdueInPeriod: tasks.filter(t =>
+        t.due_date && Number(t.due_date) >= periodStartMs && Number(t.due_date) <= periodEnd && t.status.type !== "closed"
+      ).length,
+      // Tasks with any activity (updated) in this period
+      activeInPeriod: tasks.filter(t =>
+        Number(t.date_updated) >= periodStartMs && Number(t.date_updated) <= periodEnd
+      ).length,
+      // Responsible persons for period activity
+      responsibleInPeriod: getResponsiblePersons(
+        tasks.filter(t => Number(t.date_updated) >= periodStartMs && Number(t.date_updated) <= periodEnd)
+      ),
+    };
+  }
+
   // ── status-filtered task lists (for responsibleByStatus) ───────────────────
   const overdueTaskList = tasks.filter(
     (t) =>
@@ -430,6 +474,7 @@ export async function GET(
     spaceMembersWithTasks,
     ...(asOfMs !== null ? { asOfMs } : {}),
     ...(snapshot ? { snapshot } : {}),
+    ...(periodStartMs && periodEndMs ? { periodSnapshot } : {}),
     responsibleByStatus,
     statusSummary,
     stats: {
