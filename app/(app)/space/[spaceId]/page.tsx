@@ -91,10 +91,12 @@ interface SpaceDetailResponse {
 }
 
 // ---------------------------------------------------------------------------
-// View mode type
+// View mode / filter types
 // ---------------------------------------------------------------------------
 
 type ViewMode = "project" | "person" | "timeline";
+type FilterMode = "current" | "as-of-date";
+type StatusFilter = "all" | "open" | "custom" | "closed" | "overdue";
 
 // ---------------------------------------------------------------------------
 // Priority config
@@ -933,6 +935,74 @@ function StatChip({
 }
 
 // ---------------------------------------------------------------------------
+// Filter logic (client-side, two-mode)
+// ---------------------------------------------------------------------------
+
+function filterTaskFn(
+  task: CUTask,
+  filterMode: FilterMode,
+  asOfDate: string,
+  statusFilter: StatusFilter,
+  searchText: string,
+  assigneeFilter: number | null
+): boolean {
+  // Search filter always applies
+  if (searchText && !task.name.toLowerCase().includes(searchText.toLowerCase()))
+    return false;
+
+  // Assignee filter
+  if (assigneeFilter !== null && !task.assignees.some((a) => a.id === assigneeFilter))
+    return false;
+
+  const asOfMs =
+    filterMode === "as-of-date" ? new Date(asOfDate).getTime() : Date.now();
+
+  if (statusFilter !== "all") {
+    if (filterMode === "current") {
+      if (statusFilter === "overdue")
+        return !!(
+          task.due_date &&
+          Number(task.due_date) < Date.now() &&
+          task.status.type !== "closed"
+        );
+      if (statusFilter === "open") return task.status.type === "open";
+      if (statusFilter === "custom") return task.status.type === "custom";
+      if (statusFilter === "closed") return task.status.type === "closed";
+    } else {
+      // Point-in-time
+      if (statusFilter === "overdue")
+        return !!(
+          task.due_date &&
+          Number(task.due_date) < asOfMs &&
+          (!task.date_closed || Number(task.date_closed) > asOfMs)
+        );
+      if (statusFilter === "open")
+        return (
+          Number(task.date_created) <= asOfMs &&
+          (!task.date_closed || Number(task.date_closed) > asOfMs) &&
+          task.status.type !== "closed"
+        );
+      if (statusFilter === "custom")
+        return (
+          Number(task.date_created) <= asOfMs &&
+          (!task.date_closed || Number(task.date_closed) > asOfMs)
+        );
+      if (statusFilter === "closed")
+        return !!(
+          task.date_closed && Number(task.date_closed) <= asOfMs
+        );
+    }
+  } else {
+    // All tasks: in point-in-time mode only show tasks that existed on that date
+    if (filterMode === "as-of-date") {
+      return Number(task.date_created) <= asOfMs;
+    }
+  }
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
 
@@ -986,22 +1056,18 @@ export default function SpaceDetailPage() {
         : `${Math.round(secondsAgo / 60)}m ago`;
 
   // ── Filter state ─────────────────────────────────────────────────────────
-  type StatusFilter = "all" | "open" | "in-progress" | "closed" | "overdue";
+  const [filterMode, setFilterMode] = useState<FilterMode>("current");
+  const [asOfDate, setAsOfDate] = useState<string>(
+    format(new Date(), "yyyy-MM-dd")
+  );
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [searchTerm, setSearchTerm] = useState("");
+  const [assigneeFilter, setAssigneeFilter] = useState<number | null>(null);
 
   const filterTask = useCallback(
-    (task: CUTask): boolean => {
-      if (searchTerm && !task.name.toLowerCase().includes(searchTerm.toLowerCase()))
-        return false;
-      if (statusFilter === "open") return task.status.type === "open";
-      if (statusFilter === "in-progress") return task.status.type === "custom";
-      if (statusFilter === "closed")
-        return task.status.type === "closed" || task.status.type === "done";
-      if (statusFilter === "overdue") return isOverdue(task);
-      return true;
-    },
-    [statusFilter, searchTerm]
+    (task: CUTask): boolean =>
+      filterTaskFn(task, filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter),
+    [filterMode, asOfDate, statusFilter, searchTerm, assigneeFilter]
   );
 
   const filteredByList = useMemo(
@@ -1020,6 +1086,60 @@ export default function SpaceDetailPage() {
     () => (data?.tasks ?? []).filter(filterTask),
     [data, filterTask]
   );
+
+  // ── Responsible persons (from filtered tasks) ────────────────────────────
+  const responsiblePersons = useMemo(() => {
+    const map = new Map<
+      number,
+      {
+        id: number;
+        name: string;
+        email: string;
+        color: string | null;
+        avatar: string | null;
+        initials: string;
+        count: number;
+      }
+    >();
+    for (const task of filteredTasks) {
+      for (const a of task.assignees) {
+        const existing = map.get(a.id);
+        if (existing) {
+          existing.count++;
+        } else {
+          map.set(a.id, {
+            id: a.id,
+            name: a.username ?? a.email,
+            email: a.email,
+            color: a.color ?? null,
+            avatar: a.profilePicture ?? null,
+            initials: a.initials,
+            count: 1,
+          });
+        }
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => b.count - a.count);
+  }, [filteredTasks]);
+
+  // ── Per-status counts (for summary bar) ───────────────────────────────────
+  const filteredStatusCounts = useMemo(() => {
+    const nowMs = Date.now();
+    let open = 0, inProgress = 0, closed = 0, overdue = 0;
+    for (const task of filteredTasks) {
+      if (task.status.type === "open") open++;
+      else if (task.status.type === "custom") inProgress++;
+      else if (task.status.type === "closed" || task.status.type === "done") closed++;
+      if (
+        task.due_date &&
+        Number(task.due_date) < nowMs &&
+        task.status.type !== "closed" &&
+        task.status.type !== "done"
+      )
+        overdue++;
+    }
+    return { open, inProgress, closed, overdue };
+  }, [filteredTasks]);
 
   // ── Tab counts ───────────────────────────────────────────────────────────
   const tabCounts = useMemo(
@@ -1167,15 +1287,49 @@ export default function SpaceDetailPage() {
       </div>
 
       {/* ── Filter bar ──────────────────────────────────────────────────────── */}
-      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-2.5">
+      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-2.5 space-y-2">
+        {/* Row 1: mode toggle | status pills | search */}
         <div className="flex flex-wrap items-center gap-3">
+          {/* Filter mode toggle */}
+          <div className="flex items-center gap-1 rounded-lg border border-cu-border bg-cu-hover p-0.5">
+            <button
+              onClick={() => setFilterMode("current")}
+              className={cn(
+                "rounded-md px-3 py-1 text-[11px] font-medium transition-colors",
+                filterMode === "current"
+                  ? "bg-cu-panel text-cu-text shadow-sm"
+                  : "text-cu-text-secondary hover:text-cu-text"
+              )}
+            >
+              Current State
+            </button>
+            <button
+              onClick={() => setFilterMode("as-of-date")}
+              className={cn(
+                "flex items-center gap-1 rounded-md px-3 py-1 text-[11px] font-medium transition-colors",
+                filterMode === "as-of-date"
+                  ? "bg-cu-panel text-cu-text shadow-sm"
+                  : "text-cu-text-secondary hover:text-cu-text"
+              )}
+            >
+              <Calendar className="h-3 w-3" />
+              As of Date
+            </button>
+          </div>
+
+          {/* Divider */}
+          <span className="hidden h-4 w-px bg-cu-border sm:block" />
+
           {/* Status filter pills */}
           <div className="flex items-center gap-1">
+            <span className="mr-1 text-[11px] font-medium text-cu-text-tertiary">
+              Status:
+            </span>
             {(
               [
                 { id: "all" as const, label: "All" },
                 { id: "open" as const, label: "Open" },
-                { id: "in-progress" as const, label: "In Progress" },
+                { id: "custom" as const, label: "In Progress" },
                 { id: "closed" as const, label: "Closed" },
                 { id: "overdue" as const, label: "Overdue" },
               ] as const
@@ -1186,7 +1340,9 @@ export default function SpaceDetailPage() {
                 className={cn(
                   "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
                   statusFilter === f.id
-                    ? "bg-cu-purple text-white"
+                    ? f.id === "overdue"
+                      ? "bg-red-500 text-white"
+                      : "bg-cu-purple text-white"
                     : "bg-cu-hover text-cu-text-secondary hover:text-cu-text"
                 )}
               >
@@ -1195,15 +1351,37 @@ export default function SpaceDetailPage() {
             ))}
           </div>
 
+          {/* Divider */}
+          <span className="hidden h-4 w-px bg-cu-border sm:block" />
+
           {/* Search */}
           <input
             type="text"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Search tasks…"
+            placeholder="🔍 Search tasks…"
             className="h-7 min-w-[160px] rounded-lg border border-cu-border bg-cu-panel px-2.5 text-[12px] text-cu-text placeholder:text-cu-text-tertiary focus:outline-none focus:ring-1 focus:ring-cu-purple"
           />
         </div>
+
+        {/* Row 2 (only in as-of-date mode): date picker */}
+        {filterMode === "as-of-date" && (
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] font-medium text-cu-text-secondary">
+              As of:
+            </span>
+            <input
+              type="date"
+              value={asOfDate}
+              onChange={(e) => setAsOfDate(e.target.value)}
+              className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+            />
+            <span className="text-[11px] text-cu-text-tertiary">
+              Showing tasks as they existed on{" "}
+              <strong>{format(new Date(asOfDate + "T00:00:00"), "MMMM d, yyyy")}</strong>
+            </span>
+          </div>
+        )}
       </div>
 
       {/* ── Scrollable content ──────────────────────────────────────────────── */}
@@ -1214,6 +1392,88 @@ export default function SpaceDetailPage() {
         {/* Empty state */}
         {hasNoTasks && !hasError && (
           <EmptyState message="No tasks in this space yet. Add tasks in ClickUp." />
+        )}
+
+        {/* Responsible Persons panel */}
+        {!isLoading && !hasError && data && filteredTasks.length > 0 && responsiblePersons.length > 0 && (
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <span className="shrink-0 text-[11px] font-medium text-cu-text-tertiary">
+              Responsible:
+            </span>
+            {responsiblePersons.slice(0, 12).map((person) => (
+              <button
+                key={person.id}
+                onClick={() =>
+                  setAssigneeFilter((prev) =>
+                    prev === person.id ? null : person.id
+                  )
+                }
+                title={person.email}
+                className={cn(
+                  "flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors",
+                  assigneeFilter !== null && assigneeFilter === person.id
+                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple hover:text-cu-text"
+                )}
+              >
+                <AssigneeAvatar
+                  user={{
+                    username: person.name,
+                    email: person.email,
+                    color: person.color,
+                    profilePicture: person.avatar,
+                    initials: person.initials,
+                  }}
+                  size={16}
+                />
+                <span className="max-w-[80px] truncate">{person.name}</span>
+                <span className="rounded-full bg-cu-hover px-1 text-[10px] font-semibold text-cu-text-tertiary">
+                  {person.count}
+                </span>
+              </button>
+            ))}
+            {responsiblePersons.length > 12 && (
+              <span className="text-[11px] text-cu-text-tertiary">
+                +{responsiblePersons.length - 12} more
+              </span>
+            )}
+            {assigneeFilter && (
+              <button
+                onClick={() => setAssigneeFilter(null)}
+                className="rounded-full border border-cu-border px-2 py-0.5 text-[11px] text-cu-text-tertiary transition-colors hover:border-red-300 hover:text-red-500"
+              >
+                Clear filter ×
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Per-status summary counts */}
+        {!isLoading && !hasError && data && filteredTasks.length > 0 && (
+          <div className="mb-4 flex flex-wrap items-center gap-2 text-[12px] text-cu-text-secondary">
+            <span className="font-medium text-cu-text">
+              Showing {filteredTasks.length} tasks
+            </span>
+            <span className="text-cu-border">—</span>
+            <span className="rounded-full border border-cu-border bg-cu-panel px-2 py-0.5">
+              Open:{" "}
+              <strong className="text-cu-text">{filteredStatusCounts.open}</strong>
+            </span>
+            <span className="rounded-full border border-cu-border bg-cu-panel px-2 py-0.5">
+              In Progress:{" "}
+              <strong className="text-cu-text">{filteredStatusCounts.inProgress}</strong>
+            </span>
+            <span className="rounded-full border border-cu-border bg-cu-panel px-2 py-0.5">
+              Closed:{" "}
+              <strong className="text-cu-text">{filteredStatusCounts.closed}</strong>
+            </span>
+            {filteredStatusCounts.overdue > 0 && (
+              <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-red-700">
+                Overdue:{" "}
+                <strong>{filteredStatusCounts.overdue}</strong>
+              </span>
+            )}
+          </div>
         )}
 
         {/* Content */}

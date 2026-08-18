@@ -4,6 +4,49 @@ import { getTasks, getSpaces, type CUTask } from "@/lib/clickup-client";
 export const dynamic = "force-dynamic";
 
 // ---------------------------------------------------------------------------
+// Timestamp helpers
+// ---------------------------------------------------------------------------
+
+function parseTimestamp(value: string | null): number | null {
+  if (!value) return null;
+  const n = Number(value);
+  if (!isNaN(n) && n > 0) return n;
+  const d = Date.parse(value);
+  return isNaN(d) ? null : d;
+}
+
+function getResponsiblePersons(taskList: CUTask[]) {
+  const personMap = new Map<
+    string,
+    {
+      id: string;
+      name: string;
+      email: string;
+      color: string;
+      avatar: string | null;
+      count: number;
+    }
+  >();
+  for (const task of taskList) {
+    for (const a of task.assignees) {
+      const key = String(a.id);
+      if (!personMap.has(key)) {
+        personMap.set(key, {
+          id: key,
+          name: a.username || a.email.split("@")[0],
+          email: a.email,
+          color: a.color ?? "#7b68ee",
+          avatar: a.profilePicture,
+          count: 0,
+        });
+      }
+      personMap.get(key)!.count++;
+    }
+  }
+  return [...personMap.values()].sort((a, b) => b.count - a.count);
+}
+
+// ---------------------------------------------------------------------------
 // Local fetch helper — mirrors the pattern in lib/clickup-client.ts
 // ---------------------------------------------------------------------------
 
@@ -69,9 +112,12 @@ type APIFolder = {
 // ---------------------------------------------------------------------------
 
 export async function GET(
-  _req: Request,
+  req: Request,
   { params }: { params: Promise<{ spaceId: string }> }
 ) {
+  const { searchParams } = new URL(req.url);
+  const asOfParam = searchParams.get("asOf");
+
   const teamId = process.env.CLICKUP_TEAM_ID;
   if (!teamId) {
     return NextResponse.json(
@@ -246,6 +292,80 @@ export async function GET(
   // ── stats ───────────────────────────────────────────────────────────────────
   const now = Date.now();
 
+  // ── asOf snapshot ──────────────────────────────────────────────────────────
+  const asOfMs = parseTimestamp(asOfParam);
+
+  type Snapshot = {
+    asOfMs: number;
+    totalExisted: number;
+    openOnDate: number;
+    closedByDate: number;
+    overdueOnDate: number;
+  };
+
+  let snapshot: Snapshot | null = null;
+
+  if (asOfMs) {
+    const existedOnDate = tasks.filter(
+      (t) => Number(t.date_created) <= asOfMs
+    );
+
+    const overdueOnDate = existedOnDate.filter(
+      (t) =>
+        t.due_date &&
+        Number(t.due_date) < asOfMs &&
+        (!t.date_closed || Number(t.date_closed) > asOfMs)
+    );
+
+    const closedByDate = tasks.filter(
+      (t) => t.date_closed && Number(t.date_closed) <= asOfMs
+    );
+
+    const openOnDate = existedOnDate
+      .filter(
+        (t) => !t.date_closed || Number(t.date_closed) > asOfMs
+      )
+      .filter((t) => t.status.type !== "closed");
+
+    snapshot = {
+      asOfMs,
+      totalExisted: existedOnDate.length,
+      openOnDate: openOnDate.length,
+      closedByDate: closedByDate.length,
+      overdueOnDate: overdueOnDate.length,
+    };
+  }
+
+  // ── status-filtered task lists (for responsibleByStatus) ───────────────────
+  const overdueTaskList = tasks.filter(
+    (t) =>
+      t.due_date &&
+      Number(t.due_date) < now &&
+      t.status.type !== "closed"
+  );
+  const openTaskList = tasks.filter((t) => t.status.type === "open");
+  const inProgressTaskList = tasks.filter(
+    (t) => t.status.type === "custom"
+  );
+  const closedTaskList = tasks.filter((t) => t.status.type === "closed");
+
+  // ── responsibleByStatus ────────────────────────────────────────────────────
+  const responsibleByStatus = {
+    overdue: getResponsiblePersons(overdueTaskList),
+    open: getResponsiblePersons(openTaskList),
+    inProgress: getResponsiblePersons(inProgressTaskList),
+    closed: getResponsiblePersons(closedTaskList),
+    all: getResponsiblePersons(tasks),
+  };
+
+  // ── statusSummary ──────────────────────────────────────────────────────────
+  const statusSummary = {
+    open: openTaskList.length,
+    inProgress: inProgressTaskList.length,
+    closed: closedTaskList.length,
+    overdue: overdueTaskList.length,
+  };
+
   // Priority breakdown across all tasks in the space
   const priorityBreakdown = { urgent: 0, high: 0, normal: 0, low: 0, none: 0 };
   for (const t of tasks) {
@@ -308,6 +428,10 @@ export async function GET(
     recentActivity,
     completionTrend,
     spaceMembersWithTasks,
+    ...(asOfMs !== null ? { asOfMs } : {}),
+    ...(snapshot ? { snapshot } : {}),
+    responsibleByStatus,
+    statusSummary,
     stats: {
       totalTasks: tasks.length,
       openTasks: tasks.filter((t) => t.status.type === "open").length,
