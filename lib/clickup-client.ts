@@ -314,8 +314,9 @@ export async function getSpaces(teamId: string): Promise<CUSpace[]> {
 /**
  * GET /api/v2/team/{id}/task — fetches all tasks with pagination.
  *
- * Iterates up to 10 pages (each page = up to 100 tasks).
- * Stops when the API sets last_page=true or returns fewer than 100 tasks.
+ * Fetches page 0 first, then speculatively fetches pages 1–14 in parallel
+ * (up to 1500 tasks total). Stops collecting once a page returns last_page=true
+ * or an empty tasks array.
  *
  * For array-valued params (e.g. space_ids[], list_ids[]), pass them as
  * `{ "space_ids[]": ["id1", "id2"] }` — each value is appended separately.
@@ -324,40 +325,54 @@ export async function getTasks(
   teamId: string,
   params: Record<string, string | number | boolean | string[]> = {}
 ): Promise<CUTask[]> {
-  const qs = new URLSearchParams({
-    subtasks: "true",
-    order_by: "updated",
-    reverse: "true",
-  });
+  const BASE_URL = `${BASE}/team/${teamId}/task`;
 
-  for (const [key, value] of Object.entries(params)) {
-    if (Array.isArray(value)) {
-      // ClickUp expects repeated params for arrays: space_ids[]=a&space_ids[]=b
-      for (const item of value) {
-        qs.append(key, String(item));
+  const buildQs = (page: number): string => {
+    const qs = new URLSearchParams({
+      subtasks: "true",
+      order_by: "updated",
+      reverse: "true",
+    });
+    for (const [k, v] of Object.entries(params)) {
+      if (Array.isArray(v)) {
+        // ClickUp expects repeated params for arrays: space_ids[]=a&space_ids[]=b
+        for (const item of v) qs.append(k, String(item));
+      } else {
+        qs.set(k, String(v));
       }
-    } else {
-      qs.set(key, String(value));
     }
-  }
-
-  const allTasks: CUTask[] = [];
-
-  for (let page = 0; page <= 9; page++) {
     qs.set("page", String(page));
-    const data = await get<{ tasks: CUTask[]; last_page?: boolean }>(
-      `/team/${teamId}/task?${qs.toString()}`
-    );
+    return qs.toString();
+  };
 
-    const tasks = data.tasks ?? [];
-    allTasks.push(...tasks);
+  // Page 0 first — determines whether more pages exist
+  const first = await fetchWithRetry<{ tasks: CUTask[]; last_page?: boolean }>(
+    `${BASE_URL}?${buildQs(0)}`
+  );
 
-    // Stop when the API signals the last page or returns a partial page.
-    // A partial page (< 100 items) reliably indicates end-of-data in ClickUp v2.
-    if (data.last_page === true || tasks.length === 0) break;
+  if (first.last_page || first.tasks.length === 0) {
+    return first.tasks ?? [];
   }
 
-  return allTasks;
+  // Speculatively fetch pages 1–14 in parallel (1500 tasks max)
+  const specPages = await Promise.allSettled(
+    Array.from({ length: 14 }, (_, i) =>
+      fetchWithRetry<{ tasks: CUTask[]; last_page?: boolean }>(
+        `${BASE_URL}?${buildQs(i + 1)}`
+      )
+    )
+  );
+
+  const all: CUTask[] = [...first.tasks];
+  for (const r of specPages) {
+    if (r.status !== "fulfilled" || r.value.tasks.length === 0) break;
+    all.push(...r.value.tasks);
+    if (r.value.last_page) break;
+  }
+
+  // Deduplicate by id (parallel fetches don't overlap in practice, but guard anyway)
+  const ids = new Set<string>();
+  return all.filter(t => (ids.has(t.id) ? false : (ids.add(t.id), true)));
 }
 
 /**

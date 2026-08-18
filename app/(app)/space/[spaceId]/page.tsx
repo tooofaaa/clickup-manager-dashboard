@@ -18,6 +18,7 @@ import {
   Search,
   Calendar,
   BarChart2,
+  X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { CUTask } from "@/lib/clickup-client";
@@ -97,6 +98,7 @@ interface SpaceDetailResponse {
 // ---------------------------------------------------------------------------
 
 type MainView = "period" | "cumulative";
+type DefaultTab = "all" | "open" | "inprogress" | "overdue" | "closed";
 type PeriodTab = "opened" | "completed" | "overdue" | "inprogress";
 type CumulativeTab = "stillopen" | "overdue" | "completed" | "all";
 type PeriodPreset = "thismonth" | "lastmonth" | "last3months" | "custom";
@@ -458,7 +460,7 @@ function TaskRow({
 
 interface TaskListProps {
   tasks: CUTask[];
-  tab: PeriodTab | CumulativeTab;
+  tab: string;
   periodEndMs?: number; // for overdue "days late" in period view
   cutoffMs?: number;    // for overdue "days late" in cumulative view
   searchTerm: string;
@@ -490,7 +492,7 @@ function TaskList({ tasks, tab, periodEndMs, cutoffMs, searchTerm, statusFilter 
   }
 
   const isOverdueTab = tab === "overdue";
-  const isCompletedTab = tab === "completed";
+  const isCompletedTab = tab === "completed" || tab === "closed";
   const refMs = periodEndMs ?? cutoffMs ?? Date.now();
 
   return (
@@ -733,7 +735,15 @@ export default function SpaceDetailPage() {
   // Reset countdown when data refreshes
   useEffect(() => { setCountdown(30); }, [dataUpdatedAt]);
 
-  // ── Main view toggle ──────────────────────────────────────────────────────
+  // ── Filter open/closed ────────────────────────────────────────────────────
+  // false = show general overview (all tasks, no date filter) — DEFAULT
+  // true  = show filter panel with period or cumulative mode
+  const [filterOpen, setFilterOpen] = useState(false);
+
+  // ── Default overview tab (used when filterOpen = false) ───────────────────
+  const [defaultTab, setDefaultTab] = useState<DefaultTab>("all");
+
+  // ── Main view toggle (only used when filterOpen = true) ───────────────────
   const [mainView, setMainView] = useState<MainView>("period");
 
   // ── Period view state ─────────────────────────────────────────────────────
@@ -809,6 +819,28 @@ export default function SpaceDetailPage() {
       ? tasks
       : tasks.filter((t) => t.assignees.some((a) => a.id === assigneeFilter));
 
+  // Default buckets: no date filter, sorted by date_updated desc
+  const defaultBuckets = useMemo(() => {
+    const base = applyAssigneeFilter(allTasks);
+    const now = Date.now();
+    const sorted = (arr: CUTask[]) =>
+      [...arr].sort((a, b) => Number(b.date_updated) - Number(a.date_updated));
+    return {
+      all: sorted(base),
+      open: sorted(base.filter((t) => t.status.type === "open")),
+      inprogress: sorted(
+        base.filter((t) => t.status.type !== "closed" && t.status.type !== "open")
+      ),
+      overdue: sorted(
+        base.filter(
+          (t) => t.due_date && Number(t.due_date) < now && t.status.type !== "closed"
+        )
+      ),
+      closed: sorted(base.filter((t) => t.status.type === "closed")),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allTasks, assigneeFilter]);
+
   const periodBuckets = useMemo(() => {
     const base = applyAssigneeFilter(allTasks);
     return {
@@ -833,9 +865,10 @@ export default function SpaceDetailPage() {
 
   // ── Tasks for current tab (used in responsible strip + task list) ─────────
   const currentTabTasks = useMemo(() => {
+    if (!filterOpen) return defaultBuckets[defaultTab];
     if (mainView === "period") return periodBuckets[periodTab];
     return cumulativeBuckets[cumulativeTab];
-  }, [mainView, periodTab, cumulativeTab, periodBuckets, cumulativeBuckets]);
+  }, [filterOpen, defaultTab, mainView, periodTab, cumulativeTab, defaultBuckets, periodBuckets, cumulativeBuckets]);
 
   // ── Unique statuses for filter dropdown ───────────────────────────────────
   const availableStatuses = useMemo(() => {
@@ -855,6 +888,7 @@ export default function SpaceDetailPage() {
       if (statusFilter !== "__all__") f = f.filter((t) => t.status.status === statusFilter);
       base = f.length;
     }
+    if (!filterOpen) return `Showing ${base} tasks`;
     if (mainView === "period") {
       const s = format(new Date(periodStartMs), "MMM d");
       const e = format(new Date(periodEndMs), "MMM d, yyyy");
@@ -863,32 +897,71 @@ export default function SpaceDetailPage() {
       const d = format(new Date(cutoffMs), "MMM d, yyyy");
       return `Showing ${base} tasks · Up to: ${d}`;
     }
-  }, [currentTabTasks, searchTerm, statusFilter, mainView, periodStartMs, periodEndMs, cutoffMs]);
+  }, [currentTabTasks, searchTerm, statusFilter, filterOpen, mainView, periodStartMs, periodEndMs, cutoffMs]);
 
-  // ── Period tab defs ───────────────────────────────────────────────────────
+  // ── Filter badge label ────────────────────────────────────────────────────
+  const filterBadgeLabel = useMemo(() => {
+    if (mainView === "period") {
+      const s = format(new Date(periodStartMs), "MMM d");
+      const e = format(new Date(periodEndMs), "MMM d, yyyy");
+      return `Activity: ${s} – ${e}`;
+    } else {
+      return `Status up to ${format(new Date(cutoffMs), "MMM d, yyyy")}`;
+    }
+  }, [mainView, periodStartMs, periodEndMs, cutoffMs]);
+
+  // ── Tab definitions ───────────────────────────────────────────────────────
+  const defaultTabDefs: TabDef[] = [
+    { id: "all",        label: "All",         count: defaultBuckets.all.length,        color: "var(--cu-purple)" },
+    { id: "open",       label: "Open",        count: defaultBuckets.open.length,       color: "#3b82f6" },
+    { id: "inprogress", label: "In Progress", count: defaultBuckets.inprogress.length, color: "#f59e0b" },
+    { id: "overdue",    label: "Overdue",     count: defaultBuckets.overdue.length,    color: "#ef4444" },
+    { id: "closed",     label: "Closed",      count: defaultBuckets.closed.length,     color: "#10b981" },
+  ];
+
   const periodTabDefs: TabDef[] = [
-    { id: "opened", label: "Opened", count: periodBuckets.opened.length, color: "#3b82f6" },
-    { id: "completed", label: "Completed", count: periodBuckets.completed.length, color: "#10b981" },
-    { id: "overdue", label: "Overdue", count: periodBuckets.overdue.length, color: "#ef4444" },
+    { id: "opened",     label: "Opened",      count: periodBuckets.opened.length,     color: "#3b82f6" },
+    { id: "completed",  label: "Completed",   count: periodBuckets.completed.length,  color: "#10b981" },
+    { id: "overdue",    label: "Overdue",     count: periodBuckets.overdue.length,    color: "#ef4444" },
     { id: "inprogress", label: "In Progress", count: periodBuckets.inprogress.length, color: "#f59e0b" },
   ];
 
-  // ── Cumulative tab defs ───────────────────────────────────────────────────
   const cumulativeTabDefs: TabDef[] = [
-    { id: "stillopen", label: "Still Open", count: cumulativeBuckets.stillopen.length, color: "#3b82f6" },
-    { id: "overdue", label: "Overdue", count: cumulativeBuckets.overdue.length, color: "#ef4444" },
-    { id: "completed", label: "Completed", count: cumulativeBuckets.completed.length, color: "#10b981" },
-    { id: "all", label: "All Tasks", count: cumulativeBuckets.all.length, color: "#8b5cf6" },
+    { id: "stillopen",  label: "Still Open",  count: cumulativeBuckets.stillopen.length, color: "#3b82f6" },
+    { id: "overdue",    label: "Overdue",     count: cumulativeBuckets.overdue.length,   color: "#ef4444" },
+    { id: "completed",  label: "Completed",   count: cumulativeBuckets.completed.length, color: "#10b981" },
+    { id: "all",        label: "All Tasks",   count: cumulativeBuckets.all.length,       color: "#8b5cf6" },
   ];
 
-  const activeTab = mainView === "period" ? periodTab : cumulativeTab;
-  const currentTabDefs = mainView === "period" ? periodTabDefs : cumulativeTabDefs;
+  const activeTab = !filterOpen
+    ? defaultTab
+    : mainView === "period"
+    ? periodTab
+    : cumulativeTab;
+
+  const currentTabDefs = !filterOpen
+    ? defaultTabDefs
+    : mainView === "period"
+    ? periodTabDefs
+    : cumulativeTabDefs;
 
   const handleTabSelect = (id: string) => {
     setSearchTerm("");
     setStatusFilter("__all__");
-    if (mainView === "period") setPeriodTab(id as PeriodTab);
-    else setCumulativeTab(id as CumulativeTab);
+    if (!filterOpen) {
+      setDefaultTab(id as DefaultTab);
+    } else if (mainView === "period") {
+      setPeriodTab(id as PeriodTab);
+    } else {
+      setCumulativeTab(id as CumulativeTab);
+    }
+  };
+
+  const handleClearFilter = () => {
+    setFilterOpen(false);
+    setDefaultTab("all");
+    setSearchTerm("");
+    setStatusFilter("__all__");
   };
 
   const activeTabColor =
@@ -929,7 +1002,38 @@ export default function SpaceDetailPage() {
           )}
 
           {/* Right side actions */}
-          <div className="flex items-center gap-3 shrink-0 ml-auto">
+          <div className="flex items-center gap-2 shrink-0 ml-auto flex-wrap">
+
+            {/* Filter ▼ button */}
+            <button
+              onClick={() => filterOpen ? handleClearFilter() : setFilterOpen(true)}
+              className={cn(
+                "flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-medium transition-colors",
+                filterOpen
+                  ? "border-cu-purple bg-cu-purple/10 text-cu-purple"
+                  : "border-cu-border text-cu-text-secondary hover:bg-cu-hover hover:border-cu-purple/40 hover:text-cu-text"
+              )}
+            >
+              <Calendar className="h-3.5 w-3.5" />
+              Filter
+              <ChevronDown className={cn("h-3 w-3 transition-transform", filterOpen && "rotate-180")} />
+            </button>
+
+            {/* Active filter badge */}
+            {filterOpen && (
+              <span className="flex items-center gap-1.5 rounded-full border border-cu-purple/30 bg-cu-purple/10 px-2.5 py-1 text-[11px] font-semibold text-cu-purple">
+                <Calendar className="h-3 w-3 shrink-0" />
+                Filtered: {filterBadgeLabel}
+                <button
+                  onClick={handleClearFilter}
+                  className="ml-0.5 rounded transition-colors hover:text-red-500"
+                  title="Clear filter"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            )}
+
             {/* Open in ClickUp */}
             <a
               href={`https://app.clickup.com/space/${spaceId}`}
@@ -985,153 +1089,151 @@ export default function SpaceDetailPage() {
       )}
 
       {/* ════════════════════════════════════════════════════════════════════
-          STATS STRIP
+          STATS STRIP — always shows all-time totals from the server
       ════════════════════════════════════════════════════════════════════ */}
       <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-3">
         {isLoading ? (
           <div className="flex gap-3">
-            {[0, 1, 2, 3].map((i) => (
+            {[0, 1, 2, 3, 4].map((i) => (
               <div key={i} className="h-[62px] w-[90px] animate-pulse rounded-xl bg-cu-hover" />
             ))}
           </div>
         ) : stats ? (
           <div className="flex flex-wrap gap-3">
-            <StripStat label="Total Tasks" value={stats.totalTasks} color="var(--cu-text)" />
-            <StripStat label="Open" value={stats.openTasks} color="#3b82f6" />
-            <StripStat label="Completed" value={stats.closedTasks} color="#10b981" />
-            <StripStat label="Overdue" value={stats.overdueTasks} color="#ef4444" warn />
+            <StripStat label="Total Tasks"  value={stats.totalTasks}      color="var(--cu-text)" />
+            <StripStat label="Open"         value={stats.openTasks}       color="#3b82f6" />
+            <StripStat label="In Progress"  value={stats.inProgressTasks} color="#f59e0b" />
+            <StripStat label="Closed"       value={stats.closedTasks}     color="#10b981" />
+            <StripStat label="Overdue"      value={stats.overdueTasks}    color="#ef4444" warn />
           </div>
         ) : null}
       </div>
 
       {/* ════════════════════════════════════════════════════════════════════
-          MAIN VIEW TOGGLE
+          FILTER PANEL — only shown when filterOpen = true
       ════════════════════════════════════════════════════════════════════ */}
-      <div className="shrink-0 border-b border-cu-border bg-cu-panel px-6 py-3">
-        <div className="inline-flex rounded-lg border border-cu-border bg-cu-hover p-0.5 gap-0.5">
-          <button
-            onClick={() => setMainView("period")}
-            className={cn(
-              "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-colors",
-              mainView === "period"
-                ? "bg-cu-panel text-cu-text shadow-sm"
-                : "text-cu-text-secondary hover:text-cu-text"
-            )}
-          >
-            <Calendar className="h-4 w-4" />
-            Activity in Period
-          </button>
-          <button
-            onClick={() => setMainView("cumulative")}
-            className={cn(
-              "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-colors",
-              mainView === "cumulative"
-                ? "bg-cu-panel text-cu-text shadow-sm"
-                : "text-cu-text-secondary hover:text-cu-text"
-            )}
-          >
-            <BarChart2 className="h-4 w-4" />
-            Status up to Date
-          </button>
+      {filterOpen && (
+        <div className="shrink-0 border-b border-cu-border bg-cu-panel/80 px-6 py-3">
+          {/* View mode toggle */}
+          <div className="mb-3 inline-flex rounded-lg border border-cu-border bg-cu-hover p-0.5 gap-0.5">
+            <button
+              onClick={() => setMainView("period")}
+              className={cn(
+                "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-colors",
+                mainView === "period"
+                  ? "bg-cu-panel text-cu-text shadow-sm"
+                  : "text-cu-text-secondary hover:text-cu-text"
+              )}
+            >
+              <Calendar className="h-4 w-4" />
+              Activity in Period
+            </button>
+            <button
+              onClick={() => setMainView("cumulative")}
+              className={cn(
+                "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-colors",
+                mainView === "cumulative"
+                  ? "bg-cu-panel text-cu-text shadow-sm"
+                  : "text-cu-text-secondary hover:text-cu-text"
+              )}
+            >
+              <BarChart2 className="h-4 w-4" />
+              Status up to Date
+            </button>
+          </div>
+
+          {/* Date controls */}
+          {mainView === "period" ? (
+            <div className="flex flex-wrap items-center gap-2">
+              {(
+                [
+                  { id: "thismonth",   label: "This Month" },
+                  { id: "lastmonth",   label: "Last Month" },
+                  { id: "last3months", label: "Last 3 Months" },
+                  { id: "custom",      label: "Custom" },
+                ] as const
+              ).map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => setPeriodPreset(p.id)}
+                  className={cn(
+                    "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
+                    periodPreset === p.id
+                      ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                      : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/40 hover:text-cu-text"
+                  )}
+                >
+                  {p.label}
+                </button>
+              ))}
+
+              {/* Custom date range */}
+              {periodPreset === "custom" && (
+                <div className="flex items-center gap-2 ml-1">
+                  <span className="text-[11px] font-medium text-cu-text-tertiary">From</span>
+                  <input
+                    type="date"
+                    value={customPeriodStart}
+                    onChange={(e) => setCustomPeriodStart(e.target.value)}
+                    className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                  />
+                  <span className="text-[11px] font-medium text-cu-text-tertiary">→</span>
+                  <input
+                    type="date"
+                    value={customPeriodEnd}
+                    onChange={(e) => setCustomPeriodEnd(e.target.value)}
+                    className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                  />
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              {(
+                [
+                  { id: "today",        label: "Today" },
+                  { id: "endlastmonth", label: "End of Last Month" },
+                  { id: "6monthsago",   label: "6 Months Ago" },
+                  { id: "custom",       label: "Custom" },
+                ] as const
+              ).map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => setCumulativePreset(p.id)}
+                  className={cn(
+                    "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
+                    cumulativePreset === p.id
+                      ? "border-cu-purple bg-cu-purple-light text-cu-purple"
+                      : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/40 hover:text-cu-text"
+                  )}
+                >
+                  {p.label}
+                </button>
+              ))}
+
+              {/* Custom date picker */}
+              {cumulativePreset === "custom" && (
+                <div className="flex items-center gap-2 ml-1">
+                  <span className="text-[11px] font-medium text-cu-text-tertiary">As of</span>
+                  <input
+                    type="date"
+                    value={customCutoffDate}
+                    onChange={(e) => setCustomCutoffDate(e.target.value)}
+                    className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Summary line */}
+          {!isLoading && data && (
+            <p className="mt-1.5 text-[11px] text-cu-text-tertiary">{summaryLabel}</p>
+          )}
         </div>
-      </div>
+      )}
 
-      {/* ════════════════════════════════════════════════════════════════════
-          PERIOD / CUMULATIVE CONTROLS
-      ════════════════════════════════════════════════════════════════════ */}
-      <div className="shrink-0 border-b border-cu-border bg-cu-panel/80 px-6 py-3">
-        {mainView === "period" ? (
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Preset buttons */}
-            {(
-              [
-                { id: "thismonth", label: "This Month" },
-                { id: "lastmonth", label: "Last Month" },
-                { id: "last3months", label: "Last 3 Months" },
-                { id: "custom", label: "Custom" },
-              ] as const
-            ).map((p) => (
-              <button
-                key={p.id}
-                onClick={() => setPeriodPreset(p.id)}
-                className={cn(
-                  "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
-                  periodPreset === p.id
-                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
-                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/40 hover:text-cu-text"
-                )}
-              >
-                {p.label}
-              </button>
-            ))}
-
-            {/* Custom date range */}
-            {periodPreset === "custom" && (
-              <div className="flex items-center gap-2 ml-1">
-                <span className="text-[11px] font-medium text-cu-text-tertiary">From</span>
-                <input
-                  type="date"
-                  value={customPeriodStart}
-                  onChange={(e) => setCustomPeriodStart(e.target.value)}
-                  className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-                />
-                <span className="text-[11px] font-medium text-cu-text-tertiary">→</span>
-                <input
-                  type="date"
-                  value={customPeriodEnd}
-                  onChange={(e) => setCustomPeriodEnd(e.target.value)}
-                  className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-                />
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Preset buttons */}
-            {(
-              [
-                { id: "today", label: "Today" },
-                { id: "endlastmonth", label: "End of Last Month" },
-                { id: "6monthsago", label: "6 Months Ago" },
-                { id: "custom", label: "Custom" },
-              ] as const
-            ).map((p) => (
-              <button
-                key={p.id}
-                onClick={() => setCumulativePreset(p.id)}
-                className={cn(
-                  "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
-                  cumulativePreset === p.id
-                    ? "border-cu-purple bg-cu-purple-light text-cu-purple"
-                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple/40 hover:text-cu-text"
-                )}
-              >
-                {p.label}
-              </button>
-            ))}
-
-            {/* Custom date picker */}
-            {cumulativePreset === "custom" && (
-              <div className="flex items-center gap-2 ml-1">
-                <span className="text-[11px] font-medium text-cu-text-tertiary">As of</span>
-                <input
-                  type="date"
-                  value={customCutoffDate}
-                  onChange={(e) => setCustomCutoffDate(e.target.value)}
-                  className="h-7 rounded-lg border border-cu-border bg-cu-panel px-2 text-[12px] text-cu-text focus:outline-none focus:ring-1 focus:ring-cu-purple"
-                />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Summary line */}
-        {!isLoading && data && (
-          <p className="mt-1.5 text-[11px] text-cu-text-tertiary">{summaryLabel}</p>
-        )}
-      </div>
-
-      {/* Responsible persons strip */}
+      {/* Responsible persons strip — always visible, based on current visible tasks */}
       {!isLoading && !hasError && data && (
         <ResponsibleStrip
           tasks={currentTabTasks}
@@ -1219,21 +1321,27 @@ export default function SpaceDetailPage() {
               {currentTabTasks.length === 0 ? (
                 <div className="flex flex-col items-center justify-center gap-3 py-20 text-center">
                   <span className="text-4xl">
-                    {activeTab === "completed" ? "✓" : activeTab === "overdue" ? "⏰" : "📋"}
+                    {activeTab === "completed" || activeTab === "closed"
+                      ? "✓"
+                      : activeTab === "overdue"
+                      ? "⏰"
+                      : "📋"}
                   </span>
                   <p className="text-[14px] font-medium text-cu-text-secondary">No tasks in this category</p>
                   <p className="text-[12px] text-cu-text-tertiary max-w-xs">
-                    {mainView === "period"
+                    {filterOpen && mainView === "period"
                       ? "Adjust the period range to see more activity"
-                      : "Adjust the cutoff date to see more tasks"}
+                      : filterOpen && mainView === "cumulative"
+                      ? "Adjust the cutoff date to see more tasks"
+                      : "No tasks match this status filter"}
                   </p>
                 </div>
               ) : (
                 <TaskList
                   tasks={currentTabTasks}
-                  tab={activeTab as PeriodTab & CumulativeTab}
-                  periodEndMs={mainView === "period" ? periodEndMs : undefined}
-                  cutoffMs={mainView === "cumulative" ? cutoffMs : undefined}
+                  tab={activeTab}
+                  periodEndMs={filterOpen && mainView === "period" ? periodEndMs : undefined}
+                  cutoffMs={filterOpen && mainView === "cumulative" ? cutoffMs : undefined}
                   searchTerm={searchTerm}
                   statusFilter={statusFilter}
                 />

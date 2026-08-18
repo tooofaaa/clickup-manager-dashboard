@@ -15,6 +15,7 @@ import {
   ChevronUp,
   Calendar,
   ArrowUpDown,
+  X,
 } from "lucide-react";
 import { apiGet } from "@/lib/api";
 
@@ -80,42 +81,6 @@ interface TeamEvalResponse {
 
 type PeriodPreset = "this-month" | "last-month" | "this-quarter" | "custom";
 
-function getPresetRange(
-  preset: PeriodPreset,
-  customStart: string,
-  customEnd: string
-): { start: number; end: number } {
-  const now = new Date();
-  const today = Date.now();
-
-  if (preset === "this-month") {
-    return {
-      start: new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
-      end: today,
-    };
-  }
-  if (preset === "last-month") {
-    return {
-      start: new Date(now.getFullYear(), now.getMonth() - 1, 1).getTime(),
-      end: new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999).getTime(),
-    };
-  }
-  if (preset === "this-quarter") {
-    const q = Math.floor(now.getMonth() / 3);
-    return {
-      start: new Date(now.getFullYear(), q * 3, 1).getTime(),
-      end: today,
-    };
-  }
-  // custom
-  return {
-    start: customStart
-      ? new Date(customStart).getTime()
-      : new Date(now.getFullYear(), now.getMonth(), 1).getTime(),
-    end: customEnd ? new Date(customEnd + "T23:59:59").getTime() : today,
-  };
-}
-
 function formatPeriodLabel(start: number, end: number): string {
   const opts: Intl.DateTimeFormatOptions = {
     month: "short",
@@ -123,6 +88,32 @@ function formatPeriodLabel(start: number, end: number): string {
     year: "numeric",
   };
   return `${new Date(start).toLocaleDateString(undefined, opts)} – ${new Date(end).toLocaleDateString(undefined, opts)}`;
+}
+
+function presetToLabel(
+  preset: PeriodPreset,
+  customStart: string,
+  customEnd: string
+): string {
+  const now = new Date();
+  if (preset === "this-month") {
+    return now.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }
+  if (preset === "last-month") {
+    const last = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    return last.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }
+  if (preset === "this-quarter") {
+    const q = Math.floor(now.getMonth() / 3) + 1;
+    return `Q${q} ${now.getFullYear()}`;
+  }
+  // custom
+  if (customStart && customEnd) {
+    const s = new Date(customStart).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    const e = new Date(customEnd).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+    return `${s} – ${e}`;
+  }
+  return "Custom period";
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +221,13 @@ function StatChip({
 // Space Card
 // ---------------------------------------------------------------------------
 
-function SpaceCard({ space }: { space: SpaceHealth }) {
+function SpaceCard({
+  space,
+  periodLabel,
+}: {
+  space: SpaceHealth;
+  periodLabel?: string;
+}) {
   const router = useRouter();
   const isEmpty = space.total === 0;
 
@@ -268,6 +265,13 @@ function SpaceCard({ space }: { space: SpaceHealth }) {
           </p>
         ) : (
           <>
+            {/* Filtered view label */}
+            {periodLabel && (
+              <p className="text-[10px] font-medium text-cu-purple bg-cu-purple/10 rounded px-1.5 py-0.5 w-fit">
+                Filtered view: {periodLabel}
+              </p>
+            )}
+
             {/* Progress */}
             <div>
               <div className="mb-1.5 flex items-center justify-between text-xs">
@@ -418,22 +422,22 @@ const SORT_OPTIONS: { key: SortKey; label: string }[] = [
 // ---------------------------------------------------------------------------
 
 export default function ProjectsPage() {
-  const [preset, setPreset] = useState<PeriodPreset>("this-month");
+  // ── Filter state — no filter by default ───────────────────────────────────
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+  const [activePreset, setActivePreset] = useState<PeriodPreset | null>(null);
+  const [selectedPreset, setSelectedPreset] = useState<PeriodPreset>("this-month");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
+
   const [sortKey, setSortKey] = useState<SortKey>("tasks");
   const [teamExpanded, setTeamExpanded] = useState(false);
   const [now, setNow] = useState(Date.now());
 
-  const period = getPresetRange(preset, customStart, customEnd);
-
+  // ── API — no period params; team-eval returns all-time data ───────────────
   const { data, isFetching, dataUpdatedAt, refetch } =
     useQuery<TeamEvalResponse>({
-      queryKey: ["projects-overview", period.start, period.end],
-      queryFn: () =>
-        apiGet<TeamEvalResponse>(
-          `/api/clickup/team-eval?start=${period.start}&end=${period.end}`
-        ),
+      queryKey: ["projects-overview"],
+      queryFn: () => apiGet<TeamEvalResponse>(`/api/clickup/team-eval`),
       refetchInterval: 60_000,
       refetchIntervalInBackground: false,
     });
@@ -464,14 +468,33 @@ export default function ProjectsPage() {
   }, [spaces, sortKey]);
 
   const isInitialLoad = isFetching && !data;
-  const apiPeriod = data?.period ?? period;
-  const periodLabel = formatPeriodLabel(apiPeriod.start, apiPeriod.end);
+
+  // ── Period label for badge / cards ────────────────────────────────────────
+  const activePeriodLabel = useMemo(() => {
+    if (!activePreset) return null;
+    return presetToLabel(activePreset, customStart, customEnd);
+  }, [activePreset, customStart, customEnd]);
+
+  // When user picks a preset in the panel, immediately activate it
+  const handleSelectPreset = (p: PeriodPreset) => {
+    setSelectedPreset(p);
+    setActivePreset(p);
+  };
+
+  const handleClearFilter = () => {
+    setActivePreset(null);
+    setFilterPanelOpen(false);
+  };
+
+  // Format the server period for display (shows what the API returned)
+  const apiPeriod = data?.period;
+  const apiPeriodLabel = apiPeriod ? formatPeriodLabel(apiPeriod.start, apiPeriod.end) : null;
 
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-cu-bg">
       {/* ── Sticky header ────────────────────────────────────────────────── */}
       <div className="sticky top-0 z-10 border-b border-cu-border bg-cu-bg/95 px-6 py-4 backdrop-blur-sm">
-        <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
           <div>
             <h1 className="text-xl font-bold text-cu-text">Projects</h1>
             <p className="text-xs text-cu-text-tertiary">
@@ -479,7 +502,119 @@ export default function ProjectsPage() {
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            {/* Filter by period button */}
+            <div className="relative">
+              <button
+                onClick={() => setFilterPanelOpen((v) => !v)}
+                className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium shadow-sm transition-colors ${
+                  filterPanelOpen || activePreset
+                    ? "border-cu-purple bg-cu-purple/10 text-cu-purple"
+                    : "border-cu-border bg-cu-panel text-cu-text-secondary hover:border-cu-purple hover:text-cu-purple"
+                }`}
+              >
+                <Calendar className="h-4 w-4" />
+                Filter by period
+                <ChevronDown
+                  className={`h-3.5 w-3.5 transition-transform ${filterPanelOpen ? "rotate-180" : ""}`}
+                />
+              </button>
+
+              {/* Period picker dropdown */}
+              {filterPanelOpen && (
+                <div className="absolute right-0 top-full z-20 mt-1 min-w-[280px] rounded-xl border border-cu-border bg-cu-panel p-3 shadow-lg">
+                  <p className="mb-2 text-[11px] font-semibold text-cu-text-tertiary uppercase tracking-wide">
+                    Select period
+                  </p>
+                  <div className="flex flex-col gap-1">
+                    {(
+                      [
+                        { id: "this-month",    label: "This Month" },
+                        { id: "last-month",    label: "Last Month" },
+                        { id: "this-quarter",  label: "This Quarter" },
+                        { id: "custom",        label: "Custom Range" },
+                      ] as { id: PeriodPreset; label: string }[]
+                    ).map(({ id, label }) => (
+                      <button
+                        key={id}
+                        onClick={() => handleSelectPreset(id)}
+                        className={`rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors ${
+                          selectedPreset === id && activePreset === id
+                            ? "bg-cu-purple text-white"
+                            : selectedPreset === id
+                            ? "bg-cu-purple/10 text-cu-purple"
+                            : "text-cu-text-secondary hover:bg-cu-hover hover:text-cu-text"
+                        }`}
+                      >
+                        {label}
+                        {activePreset === id && (
+                          <span className="ml-2 text-[10px] opacity-80">active</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Custom date inputs */}
+                  {selectedPreset === "custom" && (
+                    <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-cu-border pt-2">
+                      <span className="text-xs text-cu-text-tertiary">From</span>
+                      <input
+                        type="date"
+                        value={customStart}
+                        onChange={(e) => {
+                          setCustomStart(e.target.value);
+                          setActivePreset("custom");
+                        }}
+                        className="rounded-lg border border-cu-border bg-cu-panel px-2 py-1 text-xs text-cu-text focus:border-cu-purple focus:outline-none"
+                      />
+                      <span className="text-xs text-cu-text-tertiary">to</span>
+                      <input
+                        type="date"
+                        value={customEnd}
+                        onChange={(e) => {
+                          setCustomEnd(e.target.value);
+                          setActivePreset("custom");
+                        }}
+                        className="rounded-lg border border-cu-border bg-cu-panel px-2 py-1 text-xs text-cu-text focus:border-cu-purple focus:outline-none"
+                      />
+                    </div>
+                  )}
+
+                  <div className="mt-2 flex justify-between border-t border-cu-border pt-2">
+                    {activePreset && (
+                      <button
+                        onClick={handleClearFilter}
+                        className="text-xs text-cu-text-tertiary transition-colors hover:text-red-500"
+                      >
+                        Clear filter
+                      </button>
+                    )}
+                    <button
+                      onClick={() => setFilterPanelOpen(false)}
+                      className="ml-auto text-xs font-medium text-cu-purple hover:underline"
+                    >
+                      Done
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Active filter badge */}
+            {activePeriodLabel && (
+              <span className="flex items-center gap-1.5 rounded-full border border-cu-purple/30 bg-cu-purple/10 px-2.5 py-1 text-[11px] font-semibold text-cu-purple">
+                <Calendar className="h-3 w-3 shrink-0" />
+                Active filter: {activePeriodLabel}
+                <button
+                  onClick={handleClearFilter}
+                  className="ml-0.5 rounded transition-colors hover:text-red-500"
+                  title="Clear filter"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            )}
+
             <span className="hidden items-center gap-1.5 text-xs text-green-600 dark:text-green-400 sm:flex">
               <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-green-500" />
               Live · auto-syncs every 60s
@@ -501,68 +636,17 @@ export default function ProjectsPage() {
             </button>
           </div>
         </div>
+
+        {/* Close dropdown when clicking outside */}
+        {filterPanelOpen && (
+          <div
+            className="fixed inset-0 z-10"
+            onClick={() => setFilterPanelOpen(false)}
+          />
+        )}
       </div>
 
       <div className="space-y-6 px-6 py-6">
-        {/* ── Period selector ──────────────────────────────────────────────── */}
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-1 rounded-xl border border-cu-border bg-cu-panel p-1">
-            <Calendar className="ml-2 h-3.5 w-3.5 shrink-0 text-cu-text-tertiary" />
-            {(
-              [
-                { id: "this-month", label: "This Month" },
-                { id: "last-month", label: "Last Month" },
-                { id: "this-quarter", label: "This Quarter" },
-                { id: "custom", label: "Custom" },
-              ] as { id: PeriodPreset; label: string }[]
-            ).map(({ id, label }) => (
-              <button
-                key={id}
-                onClick={() => setPreset(id)}
-                className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                  preset === id
-                    ? "bg-cu-purple text-white shadow-sm"
-                    : "text-cu-text-secondary hover:bg-cu-hover hover:text-cu-text"
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs text-cu-text-tertiary">Period:</span>
-            <span className="text-xs font-medium text-cu-text">
-              {periodLabel}
-            </span>
-            {data && !insights?.hasPeriodData && (
-              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-950 dark:text-amber-400">
-                no tasks match
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Custom date inputs */}
-        {preset === "custom" && (
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs text-cu-text-tertiary">From</span>
-            <input
-              type="date"
-              value={customStart}
-              onChange={(e) => setCustomStart(e.target.value)}
-              className="rounded-lg border border-cu-border bg-cu-panel px-3 py-1.5 text-xs text-cu-text focus:border-cu-purple focus:outline-none"
-            />
-            <span className="text-xs text-cu-text-tertiary">to</span>
-            <input
-              type="date"
-              value={customEnd}
-              onChange={(e) => setCustomEnd(e.target.value)}
-              className="rounded-lg border border-cu-border bg-cu-panel px-3 py-1.5 text-xs text-cu-text focus:border-cu-purple focus:outline-none"
-            />
-          </div>
-        )}
-
         {/* ── KPI summary bar ──────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <KpiCard
@@ -576,7 +660,7 @@ export default function ProjectsPage() {
             label="Total Tasks"
             value={isInitialLoad ? "—" : (insights?.totalTasks ?? 0)}
             sub={
-              insights?.completedInPeriod != null
+              insights?.completedInPeriod != null && insights.completedInPeriod > 0
                 ? `${insights.completedInPeriod} completed`
                 : undefined
             }
@@ -600,6 +684,13 @@ export default function ProjectsPage() {
             color="bg-green-500/10"
           />
         </div>
+
+        {/* API period info (subtle, not a filter — just shows what data range the server used) */}
+        {apiPeriodLabel && !isInitialLoad && (
+          <p className="text-[11px] text-cu-text-tertiary">
+            All-time data · server period: {apiPeriodLabel}
+          </p>
+        )}
 
         {/* ── Sort controls ────────────────────────────────────────────────── */}
         {!isInitialLoad && sortedSpaces.length > 0 && (
@@ -644,7 +735,11 @@ export default function ProjectsPage() {
         ) : (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 xl:grid-cols-4">
             {sortedSpaces.map((space) => (
-              <SpaceCard key={space.spaceId} space={space} />
+              <SpaceCard
+                key={space.spaceId}
+                space={space}
+                periodLabel={activePeriodLabel ?? undefined}
+              />
             ))}
           </div>
         )}

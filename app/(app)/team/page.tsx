@@ -634,7 +634,8 @@ export default function TeamEvalPage() {
         }
         return r.json() as Promise<TeamEvalResponse>;
       },
-      staleTime: 5 * 60 * 1000,
+      staleTime: 3 * 60 * 1000,
+      refetchInterval: 2 * 60 * 1000,
       retry: 1,
     });
 

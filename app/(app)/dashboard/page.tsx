@@ -247,9 +247,9 @@ export default function DashboardPage() {
       }
       return r.json() as Promise<DashboardData>;
     },
-    staleTime:       5 * 60 * 1000,
-    // Background auto-refresh every 5 minutes so data doesn't grow stale silently
-    refetchInterval: 5 * 60 * 1000,
+    staleTime:       3 * 60 * 1000,
+    // Background auto-refresh every 2 minutes so data doesn't grow stale silently
+    refetchInterval: 2 * 60 * 1000,
     retry: 1,
   });
 
